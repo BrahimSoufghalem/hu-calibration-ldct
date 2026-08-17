@@ -1,0 +1,36 @@
+# ─── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ─── Virtual environments ──────────────────────────────────
+.venv/
+venv/
+env/
+.env
+
+# ─── Patient data (never commit) ────────────────────────────
+dataset/
+test/
+progress.json
+download_report.csv
+
+# ─── Training outputs & checkpoints ───────────────────────────
+runs/
+runs_*/
+eval_*/
+hu_audit*/
+figures/
+logs/
+*.pt
+*.pth
+*.ckpt
+
+# ─── IDE & OS ──────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
