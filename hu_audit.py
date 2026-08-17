@@ -29,6 +29,12 @@ Usage
 HU_RANGE_PRESET=benchmark python hu_audit.py \\
     --test-dir test --runs-root runs --output hu_audit \\
     --archs redcnn,resnet --include-input
+
+# Arm D: also audit trunk+head (loads <heads_root>/<arch>/best_head.pt and
+# adds a \"<Model> + Head\" row next to the bare trunk):
+HU_RANGE_PRESET=benchmark python hu_audit.py \\
+    --test-dir test --runs-root runs --heads-root runs_armD \\
+    --archs redcnn --include-input --output hu_audit_d
 """
 
 import argparse
@@ -42,6 +48,7 @@ from tqdm import tqdm
 
 import config as cfg
 from benchmark_data import denormalize_to_pixel, standardize_hu
+from calibration_head import load_head
 from evaluate_image import ARCH_MAP, get_test_set, load_checkpoint
 from utils import (
     load_dicom_tensor, setup_reproducibility, get_device,
@@ -71,12 +78,19 @@ def soft_bin_params():
     ]
 
 
-def make_model_forward(model):
-    """LDCT slice in physical HU -> denoised slice in physical HU."""
+def make_model_forward(model, head=None):
+    """LDCT slice in physical HU -> denoised slice in physical HU.
+
+    If `head` is given (arm D+), the calibration head is applied to the
+    trunk output in the standardized domain before denormalization.
+    """
     @torch.no_grad()
     def forward(low_hu):
         x = standardize_hu(low_hu).unsqueeze(0).unsqueeze(0)
-        pred_px = denormalize_to_pixel(model(x).squeeze())
+        z = model(x)
+        if head is not None:
+            z = head(z)
+        pred_px = denormalize_to_pixel(z.squeeze())
         pred_px = pred_px.clamp(0.0, cfg.EVAL_DATA_RANGE)
         return pred_px - cfg.HU_OFFSET
     return forward
@@ -228,6 +242,10 @@ def main():
     p.add_argument("--archs", default="redcnn,resnet")
     p.add_argument("--include-input", action="store_true",
                    help="Also audit the raw LDCT input (no denoising).")
+    p.add_argument("--heads-root", default=None,
+                   help="Arm D: root dir with <arch>/best_head.pt "
+                        "calibration heads. Adds a '<Model> + Head' target "
+                        "next to each bare trunk.")
     args = p.parse_args()
 
     if cfg.HU_RANGE_PRESET != "benchmark":
@@ -265,7 +283,16 @@ def main():
             print(f"  Skipping {arch}: {ckpt} not found")
             continue
         model = load_checkpoint(str(ckpt), arch, device)
-        targets.append((arch, ARCH_MAP.get(arch, arch), make_model_forward(model)))
+        label = ARCH_MAP.get(arch, arch)
+        targets.append((arch, label, make_model_forward(model)))
+        if args.heads_root:
+            head_ckpt = Path(args.heads_root) / arch / "best_head.pt"
+            if head_ckpt.exists():
+                head = load_head(str(head_ckpt), device)
+                targets.append((f"{arch}_head", f"{label} + Head",
+                                make_model_forward(model, head)))
+            else:
+                print(f"  No head for {arch}: {head_ckpt} not found")
 
     if not targets:
         print("Nothing to audit. Train baselines first or pass --include-input.")
