@@ -17,6 +17,20 @@ save_checkpoint(to_optimize=\"SSIM\"): best overall validation SSIM computed
 WITHOUT clinical windowing. MATCHED training budget: 30k iterations for
 every arm.
 
+Mixed precision (--amp)
+-----------------------
+Optional and OFF by default (the benchmark protocol is pure fp32). If you
+enable it, enable it for EVERY arm so internal comparisons stay matched.
+Safety guarantees of this implementation:
+  - only the network FORWARD runs under autocast; the model output is
+    upcast to fp32 before any loss, so all loss reductions (including the
+    soft-bin weighted sums and the alpha/beta regression of L_HU-Cal) are
+    computed in full precision;
+  - fp16 uses torch.amp.GradScaler (state saved in the checkpoint, so
+    --resume is loss-scale correct); bf16 needs no scaler;
+  - VALIDATION always runs in fp32 so the best-checkpoint selection
+    numerics are identical with and without --amp.
+
 Usage
 -----
 # Arm A -- baseline (pure MSE):
@@ -36,6 +50,10 @@ Usage
 
 # Arm C with per-bin weights (order AirLung,FatLow,Soft,Dense,Bone):
     ... --hucal-weight 0.2 --hucal-bin-weights 1,2,1,2,2
+
+# Mixed-precision training (use for ALL arms if used at all):
+    ... --amp                # fp16 + GradScaler (default dtype)
+    ... --amp --amp-dtype bf16   # Ampere+ GPUs; no scaler needed
 
 # Pilot mode (config screening only -- ranking, NOT reportable numbers):
     ... --train-patients 8 --val-patients 4 --max-iterations 8000
@@ -73,6 +91,7 @@ from utils import setup_reproducibility, get_device, get_state_dict
 
 _SELECT_CHOICES = ("ssim", "psnr", "vif", "chest_ssim", "chest_vif",
                    "bench_ssim")
+_AMP_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 
 
 def parse_args():
@@ -95,6 +114,18 @@ def parse_args():
     p.add_argument("--output-root",           default="runs")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--resume", action="store_true")
+
+    # Mixed precision
+    p.add_argument("--amp", action="store_true",
+                   help="Mixed-precision TRAINING (autocast forward only; "
+                        "all loss reductions stay fp32; validation stays "
+                        "fp32). OFF by default because the ldct-benchmark "
+                        "protocol is pure fp32. If enabled, enable it for "
+                        "ALL arms so comparisons stay matched. CUDA only.")
+    p.add_argument("--amp-dtype", choices=list(_AMP_DTYPES), default="fp16",
+                   help="Autocast dtype for --amp. 'fp16' uses a GradScaler "
+                        "(state is checkpointed, resume-safe); 'bf16' needs "
+                        "no scaler but requires Ampere or newer GPUs.")
 
     # Pilot mode
     p.add_argument("--train-patients", type=int, default=None, metavar="N",
@@ -154,9 +185,10 @@ def apply_split(split):
 def validate(model, loader, device, with_vif=False):
     """Overall AND per-region (Chest/Abdomen) validation metrics.
 
-    'bench_ssim' is the exact ldct-benchmark paper metric: overall SSIM
-    WITHOUT clinical windowing (skimage, data_range=2924, denormalized
-    clipped images).
+    Always runs in fp32 (even with --amp) so best-checkpoint selection is
+    numerically identical across precision settings. 'bench_ssim' is the
+    exact ldct-benchmark paper metric: overall SSIM WITHOUT clinical
+    windowing (skimage, data_range=2924, denormalized clipped images).
     """
     model.eval()
     sums    = dict(mse=0.0, psnr=0.0, ssim=0.0, rmse=0.0,
@@ -243,7 +275,8 @@ def lr_at(iteration, base_lr, min_lr, max_iter, schedule):
 
 def train_cycle(model, loader, optimizer, device, iteration, max_iter,
                 hu_weight=0.0, hucal=None, hucal_weight=0.0,
-                base_lr=1e-4, min_lr=1e-6, lr_schedule="constant"):
+                base_lr=1e-4, min_lr=1e-6, lr_schedule="constant",
+                use_amp=False, amp_dtype=torch.float16, scaler=None):
     model.train()
     total = count = 0.0
     bar = tqdm(loader, desc="  Train", leave=False, dynamic_ncols=True)
@@ -256,11 +289,21 @@ def train_cycle(model, loader, optimizer, device, iteration, max_iter,
         x = batch["image"].to(device, non_blocking=True)
         y = batch["label"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        pred = model(x)
-        loss = compute_loss(pred, y, hu_weight=hu_weight,
+        # Autocast covers the network forward only. The output is upcast to
+        # fp32 before the loss so every reduction (MSE, L_HU, soft-bin sums
+        # and the alpha/beta regression of L_HU-Cal) runs in full precision.
+        with torch.autocast(device_type=device.type, dtype=amp_dtype,
+                            enabled=use_amp):
+            pred = model(x)
+        loss = compute_loss(pred.float(), y.float(), hu_weight=hu_weight,
                             hucal=hucal, hucal_weight=hucal_weight)
-        loss.backward()
-        optimizer.step()
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
         iteration += 1
         total += float(loss.detach())
         count += 1
@@ -310,6 +353,21 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     ckpt_path = os.path.join(out_dir, "checkpoint.pt")
 
+    use_amp = bool(args.amp)
+    amp_dtype = _AMP_DTYPES[args.amp_dtype]
+    if use_amp and device.type != "cuda":
+        print("  WARNING: --amp requested but no CUDA device found; "
+              "training in fp32.")
+        use_amp = False
+    if use_amp and amp_dtype is torch.bfloat16 \
+            and not torch.cuda.is_bf16_supported():
+        raise RuntimeError(
+            "--amp-dtype bf16 requested but this GPU does not support "
+            "bfloat16; use --amp-dtype fp16.")
+    # GradScaler is only needed for fp16 (bf16 has fp32-like range).
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=use_amp and amp_dtype is torch.float16)
+
     with_vif = bool(args.val_vif or args.select_by in ("vif", "chest_vif"))
 
     hucal = None
@@ -342,6 +400,10 @@ def main():
     print(f"  Data dir       : {args.data_dir}")
     print(f"  Output         : {out_dir}")
     print(f"  Loss           : {loss_desc}")
+    print(f"  Precision      : "
+          + (f"AMP {args.amp_dtype} (forward only; fp32 losses/val"
+             + (", GradScaler" if scaler.is_enabled() else "")
+             + ")" if use_amp else "fp32 (benchmark protocol)"))
     print(f"  LR schedule    : {args.lr_schedule} (lr={args.lr:.2e}"
           + (f" -> {args.min_lr:.2e}" if args.lr_schedule == "cosine" else "")
           + ")")
@@ -366,6 +428,8 @@ def main():
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state"])
+        if scaler.is_enabled() and ckpt.get("scaler_state") is not None:
+            scaler.load_state_dict(ckpt["scaler_state"])
         iteration  = int(ckpt.get("iteration", 0))
         old_select = ckpt.get("select_by", "ssim")
         if old_select == args.select_by:
@@ -414,6 +478,9 @@ def main():
             base_lr=args.lr,
             min_lr=args.min_lr,
             lr_schedule=args.lr_schedule,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
         )
         val   = validate(model, val_loader, device, with_vif=with_vif)
         score = selection_score(val, args.select_by)
@@ -428,6 +495,8 @@ def main():
             "hucal_slope_lambda":     args.hucal_slope_lambda,
             "hucal_intercept_lambda": args.hucal_intercept_lambda,
             "hucal_bin_weights":      hucal_bin_weights,
+            "amp":             use_amp,
+            "amp_dtype":       args.amp_dtype if use_amp else None,
             "lr_schedule":     args.lr_schedule,
             "min_lr":          args.min_lr,
             "select_by":       args.select_by,
@@ -460,7 +529,10 @@ def main():
         if score > best_score:
             best_score = score
             torch.save(payload, os.path.join(out_dir, "best_model.pt"))
-        torch.save({**payload, "optimizer_state": optimizer.state_dict()},
+        torch.save({**payload,
+                    "optimizer_state": optimizer.state_dict(),
+                    "scaler_state": (scaler.state_dict()
+                                     if scaler.is_enabled() else None)},
                    ckpt_path)
 
         elapsed = time.time() - t0
