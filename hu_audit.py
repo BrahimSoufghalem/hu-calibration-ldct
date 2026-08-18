@@ -30,8 +30,10 @@ HU_RANGE_PRESET=benchmark python hu_audit.py \\
     --test-dir test --runs-root runs --output hu_audit \\
     --archs redcnn,resnet --include-input
 
-# Arm D: also audit trunk+head (loads <heads_root>/<arch>/best_head.pt and
-# adds a \"<Model> + Head\" row next to the bare trunk):
+# Arms D/E: also audit trunk+head (loads <heads_root>/<arch>/best_head.pt
+# and adds a \"<Model> + Head\" row next to the bare trunk). Oracle heads
+# (arm E v2 diagnostic) are handled automatically: the ground-truth body
+# type of each test patient is fed to the head.
 HU_RANGE_PRESET=benchmark python hu_audit.py \\
     --test-dir test --runs-root runs --heads-root runs_armD \\
     --archs redcnn --include-input --output hu_audit_d
@@ -81,8 +83,10 @@ def soft_bin_params():
 def make_model_forward(model, head=None):
     """LDCT slice in physical HU -> denoised slice in physical HU.
 
-    If `head` is given (arm D+), the calibration head is applied to the
-    trunk output in the standardized domain before denormalization.
+    If `head` is given (arms D/E), the calibration head is applied to the
+    trunk output in the standardized domain before denormalization. For
+    oracle heads, set `head.oracle_body` before calling (done per patient
+    in main()).
     """
     @torch.no_grad()
     def forward(low_hu):
@@ -243,7 +247,7 @@ def main():
     p.add_argument("--include-input", action="store_true",
                    help="Also audit the raw LDCT input (no denoising).")
     p.add_argument("--heads-root", default=None,
-                   help="Arm D: root dir with <arch>/best_head.pt "
+                   help="Arms D/E: root dir with <arch>/best_head.pt "
                         "calibration heads. Adds a '<Model> + Head' target "
                         "next to each bare trunk.")
     args = p.parse_args()
@@ -274,9 +278,12 @@ def main():
     print(f"Split        : {args.split} ({len(test_patients)} patients found)")
     print(f"Test patients: {[d.name for d in test_patients]}")
 
+    # Targets: (key, label, forward_fn, head_or_None). The head reference
+    # is kept so oracle heads can receive the ground-truth body type per
+    # patient.
     targets = []
     if args.include_input:
-        targets.append(("input", "LDCT input", input_forward))
+        targets.append(("input", "LDCT input", input_forward, None))
     for arch in [a.strip() for a in args.archs.split(",") if a.strip()]:
         ckpt = Path(args.runs_root) / arch / "best_model.pt"
         if not ckpt.exists():
@@ -284,13 +291,16 @@ def main():
             continue
         model = load_checkpoint(str(ckpt), arch, device)
         label = ARCH_MAP.get(arch, arch)
-        targets.append((arch, label, make_model_forward(model)))
+        targets.append((arch, label, make_model_forward(model), None))
         if args.heads_root:
             head_ckpt = Path(args.heads_root) / arch / "best_head.pt"
             if head_ckpt.exists():
                 head = load_head(str(head_ckpt), device)
+                if getattr(head, "oracle", False):
+                    print(f"  {arch}: ORACLE head detected -- ground-truth "
+                          "body type will be fed per patient.")
                 targets.append((f"{arch}_head", f"{label} + Head",
-                                make_model_forward(model, head)))
+                                make_model_forward(model, head), head))
             else:
                 print(f"  No head for {arch}: {head_ckpt} not found")
 
@@ -302,12 +312,15 @@ def main():
     centers = cfg.A_MIN + (np.arange(n_id) + 0.5) * IDENTITY_BIN_WIDTH
 
     all_dfs: dict = {}
-    for key, label, forward_fn in targets:
+    for key, label, forward_fn, head in targets:
         print(f"\nAuditing {label} ...")
         rows = []
         id_count = np.zeros(n_id, dtype=np.float64)
         id_sum   = np.zeros(n_id, dtype=np.float64)
         for d in test_patients:
+            if head is not None and getattr(head, "oracle", False):
+                head.oracle_body = ("Chest" if d.name.upper().startswith("C")
+                                    else "Abdomen")
             row, c, s = audit_patient(d.name, d, forward_fn, device)
             rows.append(row)
             id_count += c

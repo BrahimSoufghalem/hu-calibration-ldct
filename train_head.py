@@ -2,52 +2,57 @@
 
 Arm D : intensity-only head (1D transfer curve), post-hoc on a FROZEN trunk.
 Arm E : context-conditioned head -- same constrained curve, but g(z, c) is
-        conditioned on a DETACHED per-image context vector (mean, std, and
-        the 5 soft tissue-bin occupancy fractions). Motivated directly by
-        the arm C/D finding: HU bias is anatomy-dependent, so one global
-        loss/curve cannot fix chest and abdomen simultaneously. Includes
-        the anti-collapse centering penalty (per-image mean correction -> 0)
-        so the head reshapes intensities, never a per-image DC shift.
+        conditioned on a DETACHED per-image context vector. Includes the
+        anti-collapse centering penalty (per-image mean correction -> 0).
+
+v2 changes (motivated by the E-patch/E-slice results)
+-----------------------------------------------------
+1. --hucal-reduction image (DEFAULT): L_HU-Cal is computed PER IMAGE and
+   averaged. The original batch-pooled reduction (still available with
+   --hucal-reduction batch; used by the original arm D/E runs) collapses a
+   mixed chest/abdomen batch into one pooled bias target dominated by the
+   chest, destroying gradient attribution for the context pathway --
+   exactly the observed collapse of E onto D's global curve.
+2. --context-oracle: diagnostic UPPER BOUND. Replaces the inferred context
+   with the ground-truth body-type one-hot (from batch['body_type']).
+   If the oracle fixes the abdomen regression, context inference is the
+   bottleneck; if not, the bottleneck is the objective/optimizer.
+   Oracle runs: post-hoc only, --select-by val_loss only. hu_audit.py
+   audits oracle heads correctly (it sets head.oracle_body per patient).
 
 Modes
 -----
-- post-hoc (default) : trunk FROZEN, head trained alone (tiny budget,
-                       directly comparable D vs E-posthoc).
+- post-hoc (default) : trunk FROZEN, head trained alone (tiny budget).
 - --joint            : trunk trained FROM SCRATCH together with the head
                        (use the full matched budget: --max-iterations 30000
                        --iterations-before-val 1000 --select-by bench_ssim).
                        With --hucal-weight > 0 this is arm F (losses+head).
-                       Saves best_model.pt (trunk) alongside best_head.pt so
-                       hu_audit.py can audit the pair with
-                       --runs-root <out> --heads-root <out>.
 
 Objective
 ---------
-    L = w_mse*MSE + w_cal*L_HU-Cal + lambda_c*Center(corr)
+    L = w_mse*MSE + w_cal*L_HU-Cal[per-image] + lambda_c*Center(corr)
         [+ lambda_w*WaterAnchor]
 
 Usage
 -----
-# Arm D (intensity head, frozen arm-A trunk):
+# Arm E v2 (context head, slice-level context, per-image L_HU-Cal):
+    HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \\
+        --data-dir dataset --split 100p --head-type context \\
+        --patch-size 512 --val-patch-size 512 --batch-size 4 \\
+        --output-root runs_armE_v2
+
+# Oracle diagnostic (ground-truth body-type context):
+    ... --head-type context --context-oracle --output-root runs_armE_oracle
+
+# Arm D (intensity head; add --hucal-reduction batch to reproduce the
+# original arm D run exactly):
     HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \\
         --data-dir dataset --split 100p --output-root runs_armD
 
-# Arm E post-hoc (context head, frozen arm-A trunk; direct D comparison):
-    HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \\
-        --data-dir dataset --split 100p --head-type context \\
-        --output-root runs_armE
-
-# Arm E joint (context head + trunk from scratch, matched budget):
-    HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \\
-        --data-dir dataset --split 100p --head-type context --joint \\
-        --max-iterations 30000 --iterations-before-val 1000 \\
-        --select-by bench_ssim --output-root runs_armE_joint
-
-# Audit post-hoc heads (trunk rows from runs/, head rows from runs_armE/):
+# Audit (trunk rows from runs/, head rows from <heads-root>/):
     HU_RANGE_PRESET=benchmark python hu_audit.py --test-dir test \\
-        --runs-root runs --heads-root runs_armE --archs redcnn \\
-        --include-input --output hu_audit_e
-# Audit a joint run: --runs-root runs_armE_joint --heads-root runs_armE_joint
+        --runs-root runs --heads-root runs_armE_v2 --archs redcnn \\
+        --include-input --output hu_audit_e_v2
 """
 
 import argparse
@@ -96,6 +101,11 @@ def parse_args():
                    default="intensity",
                    help="'intensity' = arm D (1D curve); "
                         "'context' = arm E (per-image conditioned curve).")
+    p.add_argument("--context-oracle", action="store_true",
+                   help="Diagnostic upper bound: replace the inferred "
+                        "context with the ground-truth body-type one-hot. "
+                        "Requires --head-type context, post-hoc mode, and "
+                        "--select-by val_loss.")
     p.add_argument("--joint", action="store_true",
                    help="Train the trunk FROM SCRATCH jointly with the head "
                         "(full budget). Default: post-hoc on a frozen trunk.")
@@ -130,6 +140,12 @@ def parse_args():
     # Objective
     p.add_argument("--mse-weight",   type=float, default=1.0)
     p.add_argument("--hucal-weight", type=float, default=1.0)
+    p.add_argument("--hucal-reduction", choices=["image", "batch"],
+                   default="image",
+                   help="'image' (default, v2): L_HU-Cal per image, then "
+                        "averaged -- required for correct gradient "
+                        "attribution with a context head. 'batch': original "
+                        "pooled reduction (reproduces the first D/E runs).")
     p.add_argument("--hucal-slope-lambda",     type=float, default=0.1)
     p.add_argument("--hucal-intercept-lambda", type=float, default=0.01)
     p.add_argument("--hucal-bin-weights", type=str, default=None,
@@ -151,27 +167,57 @@ def parse_args():
 
 
 def build_head(args, device):
-    cls = (ContextCalibrationHead if args.head_type == "context"
-           else CalibrationHead)
-    return cls(hidden=args.hidden, delta_hu=args.delta_hu,
-               kappa=args.kappa).to(device)
+    if args.head_type == "context":
+        return ContextCalibrationHead(
+            hidden=args.hidden, delta_hu=args.delta_hu, kappa=args.kappa,
+            oracle=args.context_oracle).to(device)
+    return CalibrationHead(hidden=args.hidden, delta_hu=args.delta_hu,
+                           kappa=args.kappa).to(device)
 
 
-def objective(z, corr, target, head, args, hucal):
+def batch_context(head, batch, z):
+    """Explicit context for a batch: oracle one-hot when in oracle mode,
+    otherwise None (the head infers its own statistics)."""
+    if isinstance(head, ContextCalibrationHead) and head.oracle:
+        bodies = batch["body_type"]
+        return head.oracle_context_from_bodies(bodies, z.device, z.dtype)
+    return None
+
+
+def hucal_term(pred, target, hucal, reduction):
+    """L_HU-Cal with per-image or batch-pooled bin statistics."""
+    if reduction == "batch":
+        return hucal(pred, target)
+    b = pred.shape[0]
+    total = 0.0
+    for i in range(b):
+        total = total + hucal(pred[i:i + 1], target[i:i + 1])
+    return total / max(1, b)
+
+
+def objective(z, corr, target, head, args, hucal, ctx=None):
     pred = z + corr
     loss = args.mse_weight * F.mse_loss(pred, target)
     if args.hucal_weight > 0.0:
-        loss = loss + args.hucal_weight * hucal(pred, target)
+        loss = loss + args.hucal_weight * hucal_term(
+            pred, target, hucal, args.hucal_reduction)
     if args.center_lambda > 0.0 and isinstance(head, ContextCalibrationHead):
         loss = loss + args.center_lambda \
             * ContextCalibrationHead.centering_penalty(corr)
     if args.water_anchor_lambda > 0.0:
         if isinstance(head, ContextCalibrationHead):
-            anchor = head.water_anchor_penalty(z)
+            anchor = head.water_anchor_penalty(z, context=ctx)
         else:
             anchor = head.water_anchor_penalty()
         loss = loss + args.water_anchor_lambda * anchor
     return loss
+
+
+def compute_correction(head, batch, z):
+    ctx = batch_context(head, batch, z)
+    if isinstance(head, ContextCalibrationHead):
+        return head.correction(z, context=ctx), ctx
+    return head.correction(z), None
 
 
 @torch.no_grad()
@@ -183,8 +229,8 @@ def validation_objective(trunk, head, loader, device, args, hucal):
         x = batch["image"].to(device, non_blocking=True)
         y = batch["label"].to(device, non_blocking=True)
         z = trunk(x)
-        corr = head.correction(z)
-        total += float(objective(z, corr, y, head, args, hucal))
+        corr, ctx = compute_correction(head, batch, z)
+        total += float(objective(z, corr, y, head, args, hucal, ctx=ctx))
         count += 1
     return total / max(1, count)
 
@@ -193,6 +239,16 @@ def main():
     args = parse_args()
     if cfg.HU_RANGE_PRESET != "benchmark":
         raise RuntimeError("Set HU_RANGE_PRESET=benchmark.")
+    if args.context_oracle:
+        if args.head_type != "context":
+            raise ValueError("--context-oracle requires --head-type context")
+        if args.joint:
+            raise ValueError("--context-oracle is a post-hoc diagnostic; "
+                             "do not combine with --joint")
+        if args.select_by != "val_loss":
+            raise ValueError("--context-oracle requires --select-by "
+                             "val_loss (metric validation cannot pass "
+                             "body-type labels through the model forward)")
     if args.joint and args.max_iterations <= 5_000:
         print("  WARNING: --joint with a tiny budget "
               f"({args.max_iterations} iters). For reportable joint runs "
@@ -240,7 +296,9 @@ def main():
     )
 
     if args.head_type == "context":
-        if args.joint:
+        if args.context_oracle:
+            arm = "E-oracle (ground-truth context, frozen trunk)"
+        elif args.joint:
             arm = ("F (joint context head + L_HU-Cal)"
                    if args.hucal_weight > 0.0 else "E (joint context head)")
         else:
@@ -252,19 +310,22 @@ def main():
     n_params = sum(prm.numel() for prm in head.parameters())
     loss_desc = (f"{args.mse_weight}*MSE + {args.hucal_weight}*(L_SoftBias"
                  f" + {args.hucal_slope_lambda}*|a-1|"
-                 f" + {args.hucal_intercept_lambda}*|b|)")
+                 f" + {args.hucal_intercept_lambda}*|b|)"
+                 f"[{args.hucal_reduction}]")
     if args.head_type == "context" and args.center_lambda > 0.0:
         loss_desc += f" + {args.center_lambda}*Center"
     if args.water_anchor_lambda > 0.0:
         loss_desc += f" + {args.water_anchor_lambda}*WaterAnchor"
 
     print(f"\n{'='*68}")
-    print(f"  CALIBRATION HEAD TRAINING — study arm: {arm}")
+    print(f"  CALIBRATION HEAD TRAINING \u2014 study arm: {arm}")
     print(f"  arch={args.arch.upper()} | split={args.split} | seed={args.seed}")
     print(f"  Trunk          : "
           + ("FROM SCRATCH (joint)" if args.joint
              else f"{trunk_ckpt} (FROZEN)"))
-    print(f"  Head           : {args.head_type}, hidden={args.hidden}, "
+    print(f"  Head           : {args.head_type}"
+          + (" [ORACLE]" if args.context_oracle else "")
+          + f", hidden={args.hidden}, "
           f"|corr|<={args.delta_hu} HU, T'>={1.0 - args.kappa:.2f} "
           f"({n_params} params)")
     print(f"  Objective      : {loss_desc}")
@@ -315,8 +376,8 @@ def main():
             else:
                 with torch.no_grad():
                     z = trunk(x)
-            corr = head.correction(z)
-            loss = objective(z, corr, y, head, args, hucal)
+            corr, ctx = compute_correction(head, batch, z)
+            loss = objective(z, corr, y, head, args, hucal, ctx=ctx)
             loss.backward()
             optimizer.step()
             iteration += 1
@@ -325,7 +386,11 @@ def main():
             bar.set_postfix(iter=iteration, loss=f"{loss.item():.6f}")
         train_loss = total / max(1, count)
 
-        val = validate(wrapped, val_loader, device)
+        # Oracle heads cannot run the generic metric validation (labels
+        # cannot pass through model.forward); the objective is enough for
+        # val_loss selection.
+        val = None if args.context_oracle \
+            else validate(wrapped, val_loader, device)
         val_obj = validation_objective(trunk, head, val_loader, device,
                                        args, hucal)
         score = (-val_obj if args.select_by == "val_loss"
@@ -335,6 +400,7 @@ def main():
             "architecture":    args.arch,
             "study_arm":       arm,
             "head_type":       args.head_type,
+            "context_oracle":  bool(args.context_oracle),
             "joint":           bool(args.joint),
             "trunk_checkpoint": trunk_ckpt,
             "split":           args.split,
@@ -346,6 +412,7 @@ def main():
             "trunk_lr":        args.lr if args.joint else None,
             "mse_weight":      args.mse_weight,
             "hucal_weight":    args.hucal_weight,
+            "hucal_reduction": args.hucal_reduction,
             "hucal_slope_lambda":     args.hucal_slope_lambda,
             "hucal_intercept_lambda": args.hucal_intercept_lambda,
             "hucal_bin_weights":      hucal_bin_weights,
@@ -363,7 +430,8 @@ def main():
         }
         extra = {"meta": meta, "iteration": iteration, "score": score,
                  "select_by": args.select_by, "val_objective": val_obj,
-                 "val_detail": {k: v for k, v in val.items()}}
+                 "val_detail": ({k: v for k, v in val.items()}
+                                if val is not None else {})}
         save_head(head, os.path.join(out_dir, "last_head.pt"), extra)
         if args.joint:
             trunk_payload = {
@@ -385,13 +453,22 @@ def main():
                 torch.save(trunk_payload,
                            os.path.join(out_dir, "best_model.pt"))
 
-        print(
-            f"Cycle {cycle:02d} | Iter {iteration:05d}/{args.max_iterations} | "
-            f"Loss {train_loss:.6f} | ValObj {val_obj:.6f} | "
-            f"PSNR {val['psnr']:.3f} | SSIM {val['ssim']:.5f} | "
-            f"bSSIM {val['bench_ssim']:.5f} | RMSE {val['rmse']:.2f} | "
-            f"{args.select_by} {score:.6f} | {time.time() - t0:.1f}s"
-        )
+        if val is not None:
+            print(
+                f"Cycle {cycle:02d} | Iter {iteration:05d}/"
+                f"{args.max_iterations} | Loss {train_loss:.6f} | "
+                f"ValObj {val_obj:.6f} | PSNR {val['psnr']:.3f} | "
+                f"SSIM {val['ssim']:.5f} | bSSIM {val['bench_ssim']:.5f} | "
+                f"RMSE {val['rmse']:.2f} | {args.select_by} {score:.6f} | "
+                f"{time.time() - t0:.1f}s"
+            )
+        else:
+            print(
+                f"Cycle {cycle:02d} | Iter {iteration:05d}/"
+                f"{args.max_iterations} | Loss {train_loss:.6f} | "
+                f"ValObj {val_obj:.6f} | val_loss {score:.6f} | "
+                f"{time.time() - t0:.1f}s"
+            )
 
     # ------------------------------------------------------------------
     # Final diagnostics
@@ -411,21 +488,39 @@ def main():
         print(f"  Max |correction|   : {abs(corr_hu).max():.2f} HU "
               f"(bound: {args.delta_hu} HU)")
     else:
-        # Show that the context pathway differentiates images: per-image
-        # AirLung occupancy (chest proxy) vs applied correction stats.
-        print("\nContext differentiation on one validation batch "
-              "(AirLung occupancy is a chest proxy):")
+        print("\nContext differentiation on one validation batch:")
         batch = next(iter(val_loader))
         x = batch["image"].to(device)[:8]
+        bodies = list(batch["body_type"])[:8]
         with torch.no_grad():
             z = trunk(x)
-            ctx = head.context(z)
+            if args.context_oracle:
+                ctx = head.oracle_context_from_bodies(bodies, z.device,
+                                                      z.dtype)
+            else:
+                ctx = head.context(z)
             corr = head.correction(z, context=ctx)
         corr_hu = corr * BENCHMARK_PIXEL_STD
         for i in range(x.shape[0]):
-            print(f"  img {i}: AirLung occ {float(ctx[i, 2]):.4f} | "
+            tag = (f"body {str(bodies[i]):<10}" if args.context_oracle
+                   else f"AirLung occ {float(ctx[i, 2]):.4f}")
+            print(f"  img {i}: {tag} | "
                   f"mean corr {float(corr_hu[i].mean()):+7.2f} HU | "
                   f"max |corr| {float(corr_hu[i].abs().max()):6.2f} HU")
+        if args.context_oracle:
+            print("  Per-body transfer-curve corrections at bin centers:")
+            for body in ("Chest", "Abdomen"):
+                c1 = head.oracle_context_from_bodies([body], z.device,
+                                                     z.dtype)[0]
+                hu_in, hu_out = head.transfer_curve(c1)
+                ch = (hu_out - hu_in).detach().cpu().numpy()
+                hn = hu_in.detach().cpu().numpy()
+                vals = "  ".join(
+                    f"{n}:{ch[int(abs(hn - c).argmin())]:+6.1f}"
+                    for n, c in (("AirLung", -762), ("FatLow", -350),
+                                 ("Soft", 0), ("Dense", 400),
+                                 ("Bone", 1250)))
+                print(f"    {body:<8}: {vals}")
 
     total_t = time.strftime("%H:%M:%S", time.gmtime(time.time() - start))
     print(f"\nDone [{arm} / {args.arch.upper()}] in {total_t} | "

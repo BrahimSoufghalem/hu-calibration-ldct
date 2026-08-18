@@ -28,6 +28,16 @@ Context-specific guarantees (arm E design locks):
   per-image MEAN correction, forcing the head to REDISTRIBUTE intensities
   (reshape the curve) instead of collapsing into a trivial per-image DC
   shift that games bias metrics.
+
+Oracle mode (diagnostic upper bound, arm E v2):
+- ContextCalibrationHead(oracle=True) replaces the inferred statistics with
+  a GROUND-TRUTH body-type one-hot in the first two context dims (chest =
+  [1,0,0,...], abdomen = [0,1,0,...]). It separates two failure modes:
+  if the oracle fixes the abdomen regression, context INFERENCE is the
+  bottleneck; if it does not, the bottleneck is in the objective/optimizer.
+- During training/eval, pass `context=` explicitly (built with
+  `oracle_context_from_bodies`) or set `head.oracle_body` before forward
+  (hu_audit.py does the latter per patient).
 """
 
 import torch
@@ -126,10 +136,11 @@ class CalibrationHead(nn.Module):
 class ContextCalibrationHead(nn.Module):
     """Arm E: the same constrained curve, conditioned on a detached
     per-image context vector (so chest-like and abdomen-like images can
-    receive DIFFERENT transfer curves)."""
+    receive DIFFERENT transfer curves). With oracle=True the context is a
+    ground-truth body-type one-hot (diagnostic upper bound)."""
 
     def __init__(self, hidden: int = 32, delta_hu: float = 80.0,
-                 kappa: float = 0.9):
+                 kappa: float = 0.9, oracle: bool = False):
         super().__init__()
         if not (0.0 < kappa < 1.0):
             raise ValueError("kappa must be in (0, 1)")
@@ -138,6 +149,8 @@ class ContextCalibrationHead(nn.Module):
         self.hidden = int(hidden)
         self.delta_hu = float(delta_hu)
         self.kappa = float(kappa)
+        self.oracle = bool(oracle)
+        self.oracle_body = None   # set per patient by hu_audit for oracle
         self.s = float(delta_hu) / BENCHMARK_PIXEL_STD
         self.fc1 = nn.Linear(1 + CONTEXT_DIM, self.hidden)
         self.fc2 = nn.Linear(self.hidden, self.hidden)
@@ -148,10 +161,38 @@ class ContextCalibrationHead(nn.Module):
 
     def config(self) -> dict:
         return {"type": "context", "hidden": self.hidden,
-                "delta_hu": self.delta_hu, "kappa": self.kappa}
+                "delta_hu": self.delta_hu, "kappa": self.kappa,
+                "oracle": self.oracle}
+
+    @staticmethod
+    def oracle_context_from_bodies(bodies, device, dtype) -> torch.Tensor:
+        """(B, CONTEXT_DIM) ground-truth one-hot context. Any string whose
+        lowercase form starts with 'c' counts as Chest (same rule as
+        train.validate and hu_audit)."""
+        rows = []
+        for b in bodies:
+            is_chest = str(b).lower().startswith("c")
+            v = [0.0] * CONTEXT_DIM
+            v[0] = 1.0 if is_chest else 0.0
+            v[1] = 0.0 if is_chest else 1.0
+            rows.append(v)
+        return torch.tensor(rows, device=device, dtype=dtype)
 
     def context(self, z: torch.Tensor) -> torch.Tensor:
-        """(B, CONTEXT_DIM) detached per-image statistics of z."""
+        """(B, CONTEXT_DIM) detached per-image context.
+
+        Inferred statistics by default. In oracle mode, requires either an
+        explicit `context=` argument to correction() or `self.oracle_body`
+        to be set ('Chest'/'Abdomen') before forward.
+        """
+        if self.oracle:
+            if self.oracle_body is None:
+                raise RuntimeError(
+                    "Oracle head: pass context= explicitly (see "
+                    "oracle_context_from_bodies) or set head.oracle_body "
+                    "before forward.")
+            return self.oracle_context_from_bodies(
+                [self.oracle_body] * z.shape[0], z.device, z.dtype)
         b = z.shape[0]
         flat = z.detach().reshape(b, -1)
         feats = [flat.mean(dim=1), flat.std(dim=1)]
@@ -192,9 +233,12 @@ class ContextCalibrationHead(nn.Module):
         b = corr.shape[0]
         return (corr.reshape(b, -1).mean(dim=1) ** 2).mean()
 
-    def water_anchor_penalty(self, z_batch: torch.Tensor) -> torch.Tensor:
+    def water_anchor_penalty(self, z_batch: torch.Tensor,
+                             context: torch.Tensor | None = None
+                             ) -> torch.Tensor:
         """Mean squared correction at 0 HU under each image's context."""
-        context = self.context(z_batch)
+        if context is None:
+            context = self.context(z_batch)
         z0 = torch.full((context.shape[0], 1), Z_WATER,
                         device=z_batch.device, dtype=z_batch.dtype)
         return (self.correction(z0, context=context) ** 2).mean()
