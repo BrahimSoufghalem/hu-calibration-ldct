@@ -183,7 +183,8 @@ class ContextCalibrationHead(nn.Module):
     makes it a valid diagnostic upper bound (see the module docstring)."""
 
     def __init__(self, hidden: int = 32, delta_hu: float = 80.0,
-                 kappa: float = 0.9, oracle: bool = False):
+                 kappa: float = 0.9, oracle: bool = False,
+                 full_slice_context: bool = False):
         super().__init__()
         if not (0.0 < kappa < 1.0):
             raise ValueError("kappa must be in (0, 1)")
@@ -193,6 +194,7 @@ class ContextCalibrationHead(nn.Module):
         self.delta_hu = float(delta_hu)
         self.kappa = float(kappa)
         self.oracle = bool(oracle)
+        self.full_slice_context = bool(full_slice_context)
         self.oracle_body = None   # set per patient by hu_audit for oracle
         self.s = float(delta_hu) / BENCHMARK_PIXEL_STD
         self.context_dim = CONTEXT_DIM_ORACLE if self.oracle else CONTEXT_DIM
@@ -206,7 +208,8 @@ class ContextCalibrationHead(nn.Module):
     def config(self) -> dict:
         return {"type": "context", "hidden": self.hidden,
                 "delta_hu": self.delta_hu, "kappa": self.kappa,
-                "oracle": self.oracle}
+                "oracle": self.oracle,
+                "full_slice_context": self.full_slice_context}
 
     def _body_one_hot(self, bodies, device, dtype) -> torch.Tensor:
         """(B, 2) body-type one-hot. Any string whose lowercase form starts

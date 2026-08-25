@@ -27,6 +27,10 @@ from utils import sort_by_instance_number
 BENCHMARK_PIXEL_MEAN = 481.45419786099086
 BENCHMARK_PIXEL_STD = 502.18507379395044
 BENCHMARK_PIXEL_OFFSET = 1024.0
+_CONTEXT_BINS_HU = (
+    (-1024.0, -500.0), (-500.0, -200.0), (-200.0, 200.0),
+    (200.0, 600.0), (600.0, 1900.0),
+)
 
 
 def standardize_hu(hu):
@@ -54,6 +58,27 @@ class BenchmarkMeanStdd:
         return data
 
 
+class FullSliceContextd:
+    """Store detached statistics from the uncropped standardized low-dose slice.
+
+    This runs before the random crop, so every patch from a slice receives the
+    same seven-element context without retaining an additional 512x512 tensor
+    in CacheDataset memory.
+    """
+
+    def __call__(self, data):
+        flat = data["image"].reshape(-1)
+        features = [flat.mean(), flat.std()]
+        for lo_hu, hi_hu in _CONTEXT_BINS_HU:
+            center_hu = 0.5 * (lo_hu + hi_hu)
+            sigma_hu = 0.25 * (hi_hu - lo_hu)
+            center = standardize_hu(torch.tensor(center_hu))
+            sigma = sigma_hu / BENCHMARK_PIXEL_STD
+            features.append(torch.exp(-0.5 * ((flat - center) / sigma) ** 2).mean())
+        data["full_context"] = torch.stack(features).detach()
+        return data
+
+
 def _benchmark_reader():
     """Match pydicom.pixel_array orientation used by ldct-benchmark.
 
@@ -65,29 +90,41 @@ def _benchmark_reader():
     return PydicomReader(swap_ij=False)
 
 
-def _train_transform(patch_size):
-    return Compose([
-        LoadImaged(keys=["image", "label"], reader=_benchmark_reader()),
-        EnsureChannelFirstd(keys=["image", "label"]),
-        BenchmarkMeanStdd(),
+def _train_transform(patch_size, include_full_slice_context=False):
+    keys = ["image", "label"]
+    transforms = [
+        LoadImaged(keys=keys, reader=_benchmark_reader()),
+        EnsureChannelFirstd(keys=keys),
+        BenchmarkMeanStdd(keys=keys),
+    ]
+    if include_full_slice_context:
+        transforms.append(FullSliceContextd())
+    transforms.extend([
         RandSpatialCropSamplesd(
             keys=["image", "label"], roi_size=(patch_size, patch_size),
             num_samples=1,
         ),
-        ToTensord(keys=["image", "label"]),
+        ToTensord(keys=keys + (["full_context"] if include_full_slice_context else [])),
     ])
+    return Compose(transforms)
 
 
-def _val_transform(patch_size):
-    return Compose([
-        LoadImaged(keys=["image", "label"], reader=_benchmark_reader()),
-        EnsureChannelFirstd(keys=["image", "label"]),
-        BenchmarkMeanStdd(),
+def _val_transform(patch_size, include_full_slice_context=False):
+    keys = ["image", "label"]
+    transforms = [
+        LoadImaged(keys=keys, reader=_benchmark_reader()),
+        EnsureChannelFirstd(keys=keys),
+        BenchmarkMeanStdd(keys=keys),
+    ]
+    if include_full_slice_context:
+        transforms.append(FullSliceContextd())
+    transforms.extend([
         ResizeWithPadOrCropd(
             keys=["image", "label"], spatial_size=(patch_size, patch_size),
         ),
-        ToTensord(keys=["image", "label"]),
+        ToTensord(keys=keys + (["full_context"] if include_full_slice_context else [])),
     ])
+    return Compose(transforms)
 
 
 def _limit_patients(patients, max_n, label):
@@ -149,6 +186,7 @@ def prepare_benchmark_data(
     cache_rate=1.0,
     max_train_patients=None,
     max_val_patients=None,
+    include_full_slice_context=False,
 ):
     """Create patient-balanced train batches and deterministic validation crops.
 
@@ -192,8 +230,8 @@ def prepare_benchmark_data(
         generator=sampler_generator,
     )
 
-    train_transform = _train_transform(int(train_patch_size))
-    val_transform = _val_transform(int(val_patch_size))
+    train_transform = _train_transform(int(train_patch_size), include_full_slice_context)
+    val_transform = _val_transform(int(val_patch_size), include_full_slice_context)
     cache_rate = float(min(max(cache_rate, 0.0), 1.0))
     if cache and cache_rate > 0:
         train_ds = CacheDataset(
@@ -225,6 +263,8 @@ def prepare_benchmark_data(
     print(f"Train slices   : {len(train_files)} | patient-balanced replacement sampling")
     print(f"Val slices     : {len(val_files)} | deterministic center crop")
     print(f"Patches        : train {train_patch_size} | val {val_patch_size}")
+    if include_full_slice_context:
+        print("Context        : 7 statistics from full low-dose slice before crop")
     print(f"Train cycle    : {iterations_before_val} iterations x batch {train_batch_size}")
     print("DICOM orientation: PydicomReader(swap_ij=False), aligned with benchmark/evaluation")
     print(

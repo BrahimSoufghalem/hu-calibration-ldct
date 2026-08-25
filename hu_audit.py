@@ -86,14 +86,18 @@ def make_model_forward(model, head=None):
     If `head` is given (arms D/E), the calibration head is applied to the
     trunk output in the standardized domain before denormalization. For
     oracle heads, set `head.oracle_body` before calling (done per patient
-    in main()).
+    in main()). Full-slice-context heads derive their detached context from
+    the same uncropped low-dose slice supplied to the frozen trunk.
     """
     @torch.no_grad()
     def forward(low_hu):
         x = standardize_hu(low_hu).unsqueeze(0).unsqueeze(0)
         z = model(x)
         if head is not None:
-            z = head(z)
+            if getattr(head, "full_slice_context", False):
+                z = z + head.correction(z, context=head.inferred_context(x))
+            else:
+                z = head(z)
         pred_px = denormalize_to_pixel(z.squeeze())
         pred_px = pred_px.clamp(0.0, cfg.EVAL_DATA_RANGE)
         return pred_px - cfg.HU_OFFSET

@@ -71,6 +71,13 @@ Usage
         --data-dir dataset --split 100p --head-type context \\
         --context-oracle --output-root runs_armE_oracle
 
+# E-full-slice-context: the only E-v2 change is where the seven context
+# statistics are measured. They come from the paired uncropped low-dose slice;
+# the trunk, patch, loss, reduction, and budget remain unchanged.
+    HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \\
+        --data-dir dataset --split 100p --head-type context \\
+        --context-full-slice --output-root runs_armE_full_slice
+
 # Arm D (intensity head; add --hucal-reduction batch to reproduce the
 # original arm D run exactly):
     HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \\
@@ -129,10 +136,13 @@ def parse_args():
                    help="'intensity' = arm D (1D curve); "
                         "'context' = arm E (per-image conditioned curve).")
     p.add_argument("--context-oracle", action="store_true",
-                   help="Diagnostic upper bound: replace the inferred "
-                        "context with the ground-truth body-type one-hot. "
+                   help="Diagnostic upper bound: append the ground-truth "
+                        "body-type one-hot to inferred context. "
                         "Requires --head-type context, post-hoc mode, and "
                         "--select-by val_loss.")
+    p.add_argument("--context-full-slice", action="store_true",
+                   help="Infer context from the matching uncropped low-dose "
+                        "slice while trunk/loss use the configured patch.")
     p.add_argument("--joint", action="store_true",
                    help="Train the trunk FROM SCRATCH jointly with the head "
                         "(full budget). Default: post-hoc on a frozen trunk.")
@@ -197,7 +207,8 @@ def build_head(args, device):
     if args.head_type == "context":
         return ContextCalibrationHead(
             hidden=args.hidden, delta_hu=args.delta_hu, kappa=args.kappa,
-            oracle=args.context_oracle).to(device)
+            oracle=args.context_oracle,
+            full_slice_context=args.context_full_slice).to(device)
     return CalibrationHead(hidden=args.hidden, delta_hu=args.delta_hu,
                            kappa=args.kappa).to(device)
 
@@ -206,8 +217,17 @@ def batch_context(head, batch, z):
     """Explicit context for a batch: inferred features PLUS the ground-truth
     body one-hot when in oracle mode, otherwise None (the head infers its own
     statistics). The oracle context is a strict superset of the inferred one."""
-    if isinstance(head, ContextCalibrationHead) and head.oracle:
-        return head.oracle_context_from_bodies(z, batch["body_type"])
+    if isinstance(head, ContextCalibrationHead):
+        inferred = batch.get("full_context")
+        if inferred is None:
+            inferred = head.inferred_context(z)
+        else:
+            inferred = inferred.to(z.device, non_blocking=True).detach()
+        if head.oracle:
+            onehot = head._body_one_hot(batch["body_type"], z.device, z.dtype)
+            return torch.cat([inferred, onehot], dim=1)
+        if "full_context" in batch:
+            return inferred
     return None
 
 
@@ -276,8 +296,9 @@ def _context_diagnostics(trunk, head, val_loader, device, args):
         x = batch["image"].to(device, non_blocking=True)
         bodies = list(batch["body_type"])
         z = trunk(x)
-        ctx = head.oracle_context_from_bodies(z, bodies) if (
-            is_ctx and head.oracle) else head.context(z)
+        ctx = batch_context(head, batch, z) if is_ctx else None
+        if is_ctx and ctx is None:
+            ctx = head.context(z)
         corr = head.correction(z, context=ctx) * BENCHMARK_PIXEL_STD
         for i, b in enumerate(bodies):
             key = "Chest" if str(b).lower().startswith("c") else "Abdomen"
@@ -379,6 +400,15 @@ def main():
     args = parse_args()
     if cfg.HU_RANGE_PRESET != "benchmark":
         raise RuntimeError("Set HU_RANGE_PRESET=benchmark.")
+    if args.context_oracle and args.context_full_slice:
+        raise ValueError("--context-oracle and --context-full-slice are mutually exclusive")
+    if args.context_full_slice:
+        if args.head_type != "context":
+            raise ValueError("--context-full-slice requires --head-type context")
+        if args.joint:
+            raise ValueError("--context-full-slice is post-hoc only")
+        if args.select_by != "val_loss":
+            raise ValueError("--context-full-slice requires --select-by val_loss")
     if args.context_oracle:
         if args.head_type != "context":
             raise ValueError("--context-oracle requires --head-type context")
@@ -438,6 +468,8 @@ def main():
     if args.head_type == "context":
         if args.context_oracle:
             arm = "E-oracle (ground-truth context, frozen trunk)"
+        elif args.context_full_slice:
+            arm = "E-full-slice-context (inferred full-slice context, frozen trunk)"
         elif args.joint:
             arm = ("F (joint context head + L_HU-Cal)"
                    if args.hucal_weight > 0.0 else "E (joint context head)")
@@ -465,6 +497,7 @@ def main():
              else f"{trunk_ckpt} (FROZEN)"))
     print(f"  Head           : {args.head_type}"
           + (" [ORACLE]" if args.context_oracle else "")
+          + (" [FULL-SLICE CONTEXT]" if args.context_full_slice else "")
           + f", hidden={args.hidden}, "
           f"|corr|<={args.delta_hu} HU, T'>={1.0 - args.kappa:.2f} "
           f"({n_params} params)")
@@ -484,6 +517,7 @@ def main():
         cache_rate=args.cache_rate,
         max_train_patients=args.train_patients,
         max_val_patients=args.val_patients,
+        include_full_slice_context=args.context_full_slice,
     )
 
     groups = [{"params": head.parameters(), "lr": args.head_lr}]
@@ -501,7 +535,7 @@ def main():
     # there is no in-protocol reference for PSNR/SSIM/RMSE, and the claim
     # "the head does not cost image quality" cannot be checked at all.
     if not args.joint:
-        val0 = None if args.context_oracle \
+        val0 = None if (args.context_oracle or args.context_full_slice) \
             else validate(wrapped, val_loader, device)
         obj0 = validation_objective(trunk, head, val_loader, device,
                                     args, hucal)
@@ -553,7 +587,7 @@ def main():
         # Oracle heads cannot run the generic metric validation (labels
         # cannot pass through model.forward); the objective is enough for
         # val_loss selection.
-        val = None if args.context_oracle \
+        val = None if (args.context_oracle or args.context_full_slice) \
             else validate(wrapped, val_loader, device)
         val_obj = validation_objective(trunk, head, val_loader, device,
                                        args, hucal)
@@ -565,6 +599,7 @@ def main():
             "study_arm":       arm,
             "head_type":       args.head_type,
             "context_oracle":  bool(args.context_oracle),
+            "context_full_slice": bool(args.context_full_slice),
             "joint":           bool(args.joint),
             "trunk_checkpoint": trunk_ckpt,
             "split":           args.split,
