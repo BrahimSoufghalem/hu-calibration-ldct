@@ -13,12 +13,36 @@ v2 changes (motivated by the E-patch/E-slice results)
    mixed chest/abdomen batch into one pooled bias target dominated by the
    chest, destroying gradient attribution for the context pathway --
    exactly the observed collapse of E onto D's global curve.
-2. --context-oracle: diagnostic UPPER BOUND. Replaces the inferred context
-   with the ground-truth body-type one-hot (from batch['body_type']).
-   If the oracle fixes the abdomen regression, context inference is the
-   bottleneck; if not, the bottleneck is the objective/optimizer.
+2. --context-oracle: diagnostic UPPER BOUND. APPENDS the ground-truth
+   body-type one-hot (from batch['body_type']) to the inferred context, so
+   the oracle sees a strict SUPERSET of what the inferred head sees.
    Oracle runs: post-hoc only, --select-by val_loss only. hu_audit.py
    audits oracle heads correctly (it sets head.oracle_body per patient).
+
+v3 changes (motivated by an independent re-analysis of the D/E audit tables)
+---------------------------------------------------------------------------
+3. The oracle context is now ADDITIVE rather than REPLACING. Previously it
+   zeroed the 7 inferred features and kept only a 2-dim one-hot, so the
+   "upper bound" actually had LESS information than the arm it was meant to
+   bound, on a different input support -- an oracle loss would have been
+   uninterpretable in both directions.
+4. Iteration-0 validation is logged. The head is identity at init, so cycle 00
+   is exactly the frozen trunk inside this protocol -- the missing baseline
+   for every "the head costs no image quality" claim.
+5. The context diagnostic no longer prints only the first validation batch.
+   That batch is a SINGLE chest patient (shuffle=False, patient-contiguous
+   slices, EXPECTED_VAL starts with 10 chest patients), so the old printout
+   could not distinguish a collapsed context from a working one. It now scans
+   both anatomies and reports between-anatomy separation, plus an oracle
+   counterfactual (same image, label flipped) that isolates the label effect.
+
+Pre-registered endpoint (calibration_head.PRIMARY_ENDPOINT)
+-----------------------------------------------------------
+dChest/dAbd applied-correction ratio on Bone, computed from the audit tables:
+    (bias_arm_chest - bias_A_chest) / (bias_arm_abd - bias_A_abd)
+Anatomy-blind = 1.00 ; ideal = 9.53 . D=0.990, E-v1=0.993, E-slice=0.986,
+E-v2=0.998 -- every existing arm is anatomy-blind. Not a loss term, not the
+selection criterion. Secondary non-circular endpoint: ThrDisagree_130HU_pct.
 
 Modes
 -----
@@ -35,14 +59,17 @@ Objective
 
 Usage
 -----
-# Arm E v2 (context head, slice-level context, per-image L_HU-Cal):
+# Arm E v2 (context head, inferred context, per-image L_HU-Cal):
     HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \\
         --data-dir dataset --split 100p --head-type context \\
-        --patch-size 512 --val-patch-size 512 --batch-size 4 \\
         --output-root runs_armE_v2
 
-# Oracle diagnostic (ground-truth body-type context):
-    ... --head-type context --context-oracle --output-root runs_armE_oracle
+# Oracle diagnostic (inferred context + ground-truth body one-hot).
+# Keep every other flag identical to the E-v2 run above: the body label is
+# the ONLY variable that may differ, or the comparison is uninterpretable.
+    HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \\
+        --data-dir dataset --split 100p --head-type context \\
+        --context-oracle --output-root runs_armE_oracle
 
 # Arm D (intensity head; add --hucal-reduction batch to reproduce the
 # original arm D run exactly):
@@ -176,11 +203,11 @@ def build_head(args, device):
 
 
 def batch_context(head, batch, z):
-    """Explicit context for a batch: oracle one-hot when in oracle mode,
-    otherwise None (the head infers its own statistics)."""
+    """Explicit context for a batch: inferred features PLUS the ground-truth
+    body one-hot when in oracle mode, otherwise None (the head infers its own
+    statistics). The oracle context is a strict superset of the inferred one."""
     if isinstance(head, ContextCalibrationHead) and head.oracle:
-        bodies = batch["body_type"]
-        return head.oracle_context_from_bodies(bodies, z.device, z.dtype)
+        return head.oracle_context_from_bodies(z, batch["body_type"])
     return None
 
 
@@ -218,6 +245,119 @@ def compute_correction(head, batch, z):
     if isinstance(head, ContextCalibrationHead):
         return head.correction(z, context=ctx), ctx
     return head.correction(z), None
+
+
+_BIN_CENTERS = (("AirLung", -762), ("FatLow", -350), ("Soft", 0),
+                ("Dense", 400), ("Bone", 1250))
+
+
+@torch.no_grad()
+def _context_diagnostics(trunk, head, val_loader, device, args):
+    """Anatomy-differentiation diagnostic for the context head.
+
+    Sampling note: val_loader has shuffle=False and collect_files() emits all
+    slices of one patient before the next, while EXPECTED_VAL starts with 10
+    chest patients (~250 slices each). So the FIRST batch is a single chest
+    patient. An earlier version of this diagnostic printed exactly that batch
+    and concluded 'the context has collapsed' -- but 8 consecutive slices of
+    one chest patient are SUPPOSED to share a context vector, so that printout
+    could not distinguish a collapsed head from a working one.
+
+    We therefore scan the whole validation set and keep chest and abdomen
+    slices separately, then report the between-anatomy separation.
+    """
+    trunk.eval()
+    head.eval()
+    is_ctx = isinstance(head, ContextCalibrationHead)
+
+    per_body = {"Chest": [], "Abdomen": []}
+    ctx_rows = {"Chest": [], "Abdomen": []}
+    for batch in val_loader:
+        x = batch["image"].to(device, non_blocking=True)
+        bodies = list(batch["body_type"])
+        z = trunk(x)
+        ctx = head.oracle_context_from_bodies(z, bodies) if (
+            is_ctx and head.oracle) else head.context(z)
+        corr = head.correction(z, context=ctx) * BENCHMARK_PIXEL_STD
+        for i, b in enumerate(bodies):
+            key = "Chest" if str(b).lower().startswith("c") else "Abdomen"
+            if len(per_body[key]) < 200:
+                per_body[key].append(float(corr[i].mean()))
+                ctx_rows[key].append(ctx[i].detach().cpu())
+        if min(len(per_body["Chest"]), len(per_body["Abdomen"])) >= 200:
+            break
+
+    print("\nContext differentiation over the validation set")
+    print(f"  (scanned until 200 slices per anatomy; "
+          f"chest {len(per_body['Chest'])}, "
+          f"abdomen {len(per_body['Abdomen'])})")
+    for key in ("Chest", "Abdomen"):
+        v = per_body[key]
+        if not v:
+            print(f"  {key:<8}: none found")
+            continue
+        m = sum(v) / len(v)
+        sd = (sum((a - m) ** 2 for a in v) / max(1, len(v) - 1)) ** 0.5
+        print(f"  {key:<8}: mean corr {m:+7.2f} HU | sd {sd:5.2f} | "
+              f"min {min(v):+7.2f} | max {max(v):+7.2f}")
+    if per_body["Chest"] and per_body["Abdomen"]:
+        mc = sum(per_body["Chest"]) / len(per_body["Chest"])
+        ma = sum(per_body["Abdomen"]) / len(per_body["Abdomen"])
+        print(f"  between-anatomy separation of mean corr: "
+              f"{abs(mc - ma):.2f} HU")
+
+    if not is_ctx:
+        return
+
+    # Per-anatomy transfer curves at a representative (median) context.
+    print("\n  Transfer-curve correction at bin centers, per anatomy context:")
+    curves = {}
+    for key in ("Chest", "Abdomen"):
+        if not ctx_rows[key]:
+            continue
+        stack = torch.stack(ctx_rows[key]).to(device)
+        c1 = stack.median(dim=0).values
+        hu_in, hu_out = head.transfer_curve(c1)
+        ch = (hu_out - hu_in).detach().cpu()
+        hn = hu_in.detach().cpu()
+        vals = {n: float(ch[int((hn - c).abs().argmin())])
+                for n, c in _BIN_CENTERS}
+        curves[key] = vals
+        print(f"    {key:<8}: " + "  ".join(
+            f"{n}:{vals[n]:+7.2f}" for n, _ in _BIN_CENTERS))
+    if len(curves) == 2:
+        print("    " + "-" * 60)
+        print("    sep     : " + "  ".join(
+            f"{n}:{abs(curves['Chest'][n] - curves['Abdomen'][n]):+7.2f}"
+            for n, _ in _BIN_CENTERS))
+
+    # The decisive counterfactual: same image, label flipped. Isolates the
+    # effect of the body label with the inferred features held fixed.
+    if head.oracle and ctx_rows["Chest"] and ctx_rows["Abdomen"]:
+        print("\n  ORACLE counterfactual -- same inferred features, "
+              "body label flipped:")
+        for key in ("Chest", "Abdomen"):
+            stack = torch.stack(ctx_rows[key]).to(device)
+            base = stack.median(dim=0).values.reshape(1, -1)
+            out = {}
+            for body in ("Chest", "Abdomen"):
+                c1 = head.with_body_override(base, body)[0]
+                hu_in, hu_out = head.transfer_curve(c1)
+                ch = (hu_out - hu_in).detach().cpu()
+                hn = hu_in.detach().cpu()
+                out[body] = {n: float(ch[int((hn - c).abs().argmin())])
+                             for n, c in _BIN_CENTERS}
+            print(f"    real {key} slices, forced label:")
+            for body in ("Chest", "Abdomen"):
+                print(f"      as {body:<8}: " + "  ".join(
+                    f"{n}:{out[body][n]:+7.2f}" for n, _ in _BIN_CENTERS))
+            print(f"      delta     : " + "  ".join(
+                f"{n}:{abs(out['Chest'][n] - out['Abdomen'][n]):+7.2f}"
+                for n, _ in _BIN_CENTERS))
+        print("\n  PRE-REGISTERED ENDPOINT (calibration_head.PRIMARY_ENDPOINT):")
+        print("    dChest/dAbd applied-correction ratio on Bone, from the")
+        print("    audit tables. Anatomy-blind = 1.00 ; ideal = 9.53 .")
+        print("    E-v2 measured 0.998 -- i.e. no anatomy dependence at all.")
 
 
 @torch.no_grad()
@@ -356,6 +496,30 @@ def main():
     start = time.time()
     cycle = 0
 
+    # Iteration-0 baseline. The head is identity-initialized, so this row IS
+    # the bare frozen trunk measured inside this exact protocol. Without it
+    # there is no in-protocol reference for PSNR/SSIM/RMSE, and the claim
+    # "the head does not cost image quality" cannot be checked at all.
+    if not args.joint:
+        val0 = None if args.context_oracle \
+            else validate(wrapped, val_loader, device)
+        obj0 = validation_objective(trunk, head, val_loader, device,
+                                    args, hucal)
+        if val0 is not None:
+            print(
+                f"Cycle 00 | Iter 00000/{args.max_iterations} | "
+                f"Loss {float('nan'):.6f} | ValObj {obj0:.6f} | "
+                f"PSNR {val0['psnr']:.3f} | SSIM {val0['ssim']:.5f} | "
+                f"bSSIM {val0['bench_ssim']:.5f} | RMSE {val0['rmse']:.2f} | "
+                f"{args.select_by} {-obj0:.6f} | IDENTITY INIT = FROZEN TRUNK"
+            )
+        else:
+            print(
+                f"Cycle 00 | Iter 00000/{args.max_iterations} | "
+                f"ValObj {obj0:.6f} | val_loss {-obj0:.6f} | "
+                f"IDENTITY INIT = FROZEN TRUNK"
+            )
+
     while iteration < args.max_iterations:
         cycle += 1
         t0 = time.time()
@@ -488,39 +652,7 @@ def main():
         print(f"  Max |correction|   : {abs(corr_hu).max():.2f} HU "
               f"(bound: {args.delta_hu} HU)")
     else:
-        print("\nContext differentiation on one validation batch:")
-        batch = next(iter(val_loader))
-        x = batch["image"].to(device)[:8]
-        bodies = list(batch["body_type"])[:8]
-        with torch.no_grad():
-            z = trunk(x)
-            if args.context_oracle:
-                ctx = head.oracle_context_from_bodies(bodies, z.device,
-                                                      z.dtype)
-            else:
-                ctx = head.context(z)
-            corr = head.correction(z, context=ctx)
-        corr_hu = corr * BENCHMARK_PIXEL_STD
-        for i in range(x.shape[0]):
-            tag = (f"body {str(bodies[i]):<10}" if args.context_oracle
-                   else f"AirLung occ {float(ctx[i, 2]):.4f}")
-            print(f"  img {i}: {tag} | "
-                  f"mean corr {float(corr_hu[i].mean()):+7.2f} HU | "
-                  f"max |corr| {float(corr_hu[i].abs().max()):6.2f} HU")
-        if args.context_oracle:
-            print("  Per-body transfer-curve corrections at bin centers:")
-            for body in ("Chest", "Abdomen"):
-                c1 = head.oracle_context_from_bodies([body], z.device,
-                                                     z.dtype)[0]
-                hu_in, hu_out = head.transfer_curve(c1)
-                ch = (hu_out - hu_in).detach().cpu().numpy()
-                hn = hu_in.detach().cpu().numpy()
-                vals = "  ".join(
-                    f"{n}:{ch[int(abs(hn - c).argmin())]:+6.1f}"
-                    for n, c in (("AirLung", -762), ("FatLow", -350),
-                                 ("Soft", 0), ("Dense", 400),
-                                 ("Bone", 1250)))
-                print(f"    {body:<8}: {vals}")
+        _context_diagnostics(trunk, head, val_loader, device, args)
 
     total_t = time.strftime("%H:%M:%S", time.gmtime(time.time() - start))
     print(f"\nDone [{arm} / {args.arch.upper()}] in {total_t} | "
