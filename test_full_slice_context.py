@@ -5,10 +5,17 @@ from tempfile import TemporaryDirectory
 
 import torch
 
-from benchmark_data import FullSliceContextd
+from benchmark_data import (
+    BENCHMARK_PIXEL_STD, FullSliceContextd, standardize_hu,
+)
 from calibration_head import ContextCalibrationHead
 from evaluate_image import (
     _apply_calibration_head, _head_checkpoint_meta, _patient_row,
+)
+from hu_audit import (
+    _accumulate_event_stats, _correction_at_threshold_hu,
+    _finalize_event_stats, _mask_distance_stats, _paired_threshold_stats,
+    _threshold_counts, _threshold_metrics,
 )
 from train_head import batch_context
 
@@ -110,6 +117,89 @@ def test_evaluator_rejects_mismatched_head_provenance():
             raise AssertionError("mismatched trunk was accepted")
 
 
+def test_threshold_counts_report_error_direction():
+    ref = torch.tensor([100.0, 150.0, 100.0, 150.0])
+    pred = torch.tensor([140.0, 120.0, 90.0, 160.0])
+    counts = _threshold_counts(ref, pred, 130.0)
+
+    assert counts == {
+        "ref_pos": 2,
+        "pred_pos": 2,
+        "false_pos": 1,
+        "false_neg": 1,
+        "disagree": 2,
+        "n": 4,
+    }
+    metrics = _threshold_metrics(counts)
+    assert metrics["FalsePosPrevalence_pct"] == 25.0
+    assert metrics["FalseNegPrevalence_pct"] == 25.0
+    assert metrics["FalsePositiveRate_pct"] == 50.0
+    assert metrics["FalseNegativeRate_pct"] == 50.0
+
+
+def test_threshold_distance_stats_use_pre_head_values():
+    mask = torch.tensor([True, True, False, False])
+    distance = torch.tensor([0.5, 7.0, 0.1, 0.1])
+    stats = _mask_distance_stats(mask, distance)
+
+    assert stats["Count"] == 2
+    assert stats["MeanDistance_HU"] == 3.75
+    assert stats["Within1HU_pct"] == 50.0
+    assert stats["Within5HU_pct"] == 50.0
+    assert stats["Within10HU_pct"] == 100.0
+
+
+def test_paired_threshold_stats_classify_head_changes():
+    ref = torch.tensor([140.0, 140.0, 120.0, 120.0, 140.0, 120.0])
+    trunk = torch.tensor([129.0, 131.0, 129.0, 131.0, 125.0, 135.0])
+    head = torch.tensor([131.0, 129.0, 131.0, 129.0, 125.0, 135.0])
+
+    stats, masks, distance = _paired_threshold_stats(ref, trunk, head, 130.0)
+
+    assert masks["FlipUp"].tolist() == [True, False, True, False, False, False]
+    assert masks["FlipDown"].tolist() == [False, True, False, True, False, False]
+    assert masks["NewDisagree"].tolist() == [False, True, True, False, False, False]
+    assert masks["ResolvedDisagree"].tolist() == [True, False, False, True, False, False]
+    assert distance.tolist() == [1.0, 1.0, 1.0, 1.0, 5.0, 5.0]
+    assert stats["NewDisagree"]["Count"] == 2
+    assert stats["ResolvedDisagree"]["Count"] == 2
+    assert stats["NewDisagree"]["MeanDistance_HU"] == 1.0
+
+
+def test_patient_event_aggregation_is_pixel_weighted():
+    total = {"count": 0, "distance_sum": 0.0,
+             "bands": {band: 0 for band in (1.0, 2.0, 5.0, 10.0, 20.0)}}
+    mask_a = torch.tensor([True, False])
+    distance_a = torch.tensor([1.0, 99.0])
+    stats_a = _mask_distance_stats(mask_a, distance_a)
+    _accumulate_event_stats(total, stats_a, mask_a, distance_a)
+
+    mask_b = torch.tensor([True, True, True])
+    distance_b = torch.tensor([3.0, 5.0, 7.0])
+    stats_b = _mask_distance_stats(mask_b, distance_b)
+    _accumulate_event_stats(total, stats_b, mask_b, distance_b)
+    result = _finalize_event_stats(total, total_pixels=20)
+
+    assert result["Count"] == 4
+    assert result["pct"] == 20.0
+    assert result["MeanDistance_HU"] == 4.0
+    assert result["Within5HU_pct"] == 75.0
+
+
+def test_threshold_correction_is_converted_to_hu():
+    torch.manual_seed(1)
+    head = ContextCalibrationHead(full_slice_context=True)
+    torch.nn.init.zeros_(head.fc3.weight)
+    torch.nn.init.constant_(head.fc3.bias, 0.25)
+    context = torch.zeros(1, head.context_dim)
+    got = _correction_at_threshold_hu(
+        head, context, 130.0, torch.device("cpu"), torch.float32)
+    z_threshold = standardize_hu(torch.tensor(130.0)).reshape(1, 1)
+    expected = float(head.correction(
+        z_threshold, context=context).reshape(-1)[0] * BENCHMARK_PIXEL_STD)
+    assert abs(got - expected) < 1e-5
+
+
 if __name__ == "__main__":
     test_context_precedes_patch_crop()
     test_batch_context_uses_full_slice_statistics_not_patch()
@@ -117,4 +207,9 @@ if __name__ == "__main__":
     test_evaluator_uses_low_dose_slice_for_full_context()
     test_evaluator_reports_deltas_against_cycle_zero()
     test_evaluator_rejects_mismatched_head_provenance()
+    test_threshold_counts_report_error_direction()
+    test_threshold_distance_stats_use_pre_head_values()
+    test_paired_threshold_stats_classify_head_changes()
+    test_patient_event_aggregation_is_pixel_weighted()
+    test_threshold_correction_is_converted_to_hu()
     print("full-slice-context checks: OK")

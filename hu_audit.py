@@ -18,11 +18,16 @@ WHAT IS MEASURED (per patient, in physical HU)
                           HU_pred against per-bin mean HU_ref.
                           Ideal: slope alpha = 1, intercept beta = 0.
 5. Threshold crossings  : fraction of pixels whose classification against
-                          fixed HU thresholds flips between reference and
-                          prediction (threshold-crossing sensitivity
-                          analysis; NOT a clinical endpoint claim).
+                           fixed HU thresholds flips between reference and
+                           prediction (threshold-crossing sensitivity
+                           analysis; NOT a clinical endpoint claim). Exports
+                           directional error prevalence plus class-conditional
+                           false-positive and false-negative rates explicitly.
 6. Identity curve       : mean HU_pred per fine HU_ref bin, exported to CSV
-                          for identity plots (HU_pred vs HU_ref).
+                           for identity plots (HU_pred vs HU_ref).
+7. Head threshold diagnostic (when --heads-root is used): paired trunk/head
+                           crossing direction, distance from 130 HU before the
+                           head, and the actual per-slice T(130)-130 correction.
 
 Usage
 -----
@@ -49,8 +54,10 @@ import torch
 from tqdm import tqdm
 
 import config as cfg
-from benchmark_data import denormalize_to_pixel, standardize_hu
-from calibration_head import load_head
+from benchmark_data import (
+    BENCHMARK_PIXEL_STD, denormalize_to_pixel, standardize_hu,
+)
+from calibration_head import ContextCalibrationHead, load_head
 from evaluate_image import ARCH_MAP, get_test_set, load_checkpoint
 from utils import (
     load_dicom_tensor, setup_reproducibility, get_device,
@@ -70,6 +77,7 @@ TISSUE_BINS = (
 SOFT_SIGMA_FRACTION = 0.25   # sigma_k = 0.25 * bin width
 THRESHOLDS_HU = (-950.0, 0.0, 100.0, 130.0)
 IDENTITY_BIN_WIDTH = 25.0    # fine bins for the identity curve
+HEAD_DIAGNOSTIC_THRESHOLD_HU = 130.0
 
 
 def soft_bin_params():
@@ -80,7 +88,56 @@ def soft_bin_params():
     ]
 
 
-def make_model_forward(model, head=None):
+def _head_context(head, x, z, body):
+    if not isinstance(head, ContextCalibrationHead):
+        return None
+    if head.full_slice_context:
+        return head.inferred_context(x)
+    if head.oracle:
+        return head.oracle_context_from_bodies(z, [body] * z.shape[0])
+    return head.inferred_context(z)
+
+
+def _apply_head(head, x, z, body):
+    context = _head_context(head, x, z, body)
+    if isinstance(head, ContextCalibrationHead):
+        return z + head.correction(z, context=context), context
+    return head(z), None
+
+
+def _threshold_counts(ref_hu, pred_hu, threshold):
+    ref_pos = ref_hu > threshold
+    pred_pos = pred_hu > threshold
+    false_pos = (~ref_pos) & pred_pos
+    false_neg = ref_pos & (~pred_pos)
+    return {
+        "ref_pos": int(ref_pos.sum()),
+        "pred_pos": int(pred_pos.sum()),
+        "false_pos": int(false_pos.sum()),
+        "false_neg": int(false_neg.sum()),
+        "disagree": int((false_pos | false_neg).sum()),
+        "n": int(ref_pos.numel()),
+    }
+
+
+def _threshold_metrics(counts):
+    n = max(1, counts["n"])
+    ref_pos = counts["ref_pos"]
+    ref_neg = counts["n"] - ref_pos
+    return {
+        "Disagree_pct": 100.0 * counts["disagree"] / n,
+        "RefPos_pct": 100.0 * ref_pos / n,
+        "PredPos_pct": 100.0 * counts["pred_pos"] / n,
+        "FalsePosPrevalence_pct": 100.0 * counts["false_pos"] / n,
+        "FalseNegPrevalence_pct": 100.0 * counts["false_neg"] / n,
+        "FalsePositiveRate_pct": (100.0 * counts["false_pos"] / ref_neg
+                                  if ref_neg else float("nan")),
+        "FalseNegativeRate_pct": (100.0 * counts["false_neg"] / ref_pos
+                                  if ref_pos else float("nan")),
+    }
+
+
+def make_model_forward(model, head=None, body=None):
     """LDCT slice in physical HU -> denoised slice in physical HU.
 
     If `head` is given (arms D/E), the calibration head is applied to the
@@ -94,10 +151,13 @@ def make_model_forward(model, head=None):
         x = standardize_hu(low_hu).unsqueeze(0).unsqueeze(0)
         z = model(x)
         if head is not None:
-            if getattr(head, "full_slice_context", False):
-                z = z + head.correction(z, context=head.inferred_context(x))
+            if body is None:
+                body_name = getattr(head, "oracle_body", None)
+                if getattr(head, "oracle", False) and body_name is None:
+                    raise RuntimeError("Oracle head requires a body type")
             else:
-                z = head(z)
+                body_name = body
+            z, _ = _apply_head(head, x, z, body_name)
         pred_px = denormalize_to_pixel(z.squeeze())
         pred_px = pred_px.clamp(0.0, cfg.EVAL_DATA_RANGE)
         return pred_px - cfg.HU_OFFSET
@@ -108,6 +168,150 @@ def make_model_forward(model, head=None):
 def input_forward(low_hu):
     """Audit the raw LDCT input itself (no-denoising reference row)."""
     return low_hu.clamp(cfg.A_MIN, cfg.A_MAX)
+
+
+_DISTANCE_BANDS_HU = (1.0, 2.0, 5.0, 10.0, 20.0)
+
+
+def _mask_distance_stats(mask, distance_hu):
+    count = int(mask.sum())
+    stats = {
+        "Count": count,
+        "MeanDistance_HU": (float(distance_hu[mask].sum()) / count
+                            if count else float("nan")),
+    }
+    for band in _DISTANCE_BANDS_HU:
+        tag = f"Within{int(band)}HU_pct"
+        stats[tag] = (100.0 * int((mask & (distance_hu <= band)).sum()) / count
+                      if count else float("nan"))
+    return stats
+
+
+def _prefixed_stats(row, prefix, stats):
+    for key, value in stats.items():
+        row[f"{prefix}_{key}"] = value
+
+
+def _paired_threshold_stats(ref_hu, trunk_hu, head_hu, threshold):
+    ref_pos = ref_hu > threshold
+    trunk_pos = trunk_hu > threshold
+    head_pos = head_hu > threshold
+    trunk_wrong = ref_pos ^ trunk_pos
+    head_wrong = ref_pos ^ head_pos
+    masks = {
+        "FlipUp": (~trunk_pos) & head_pos,
+        "FlipDown": trunk_pos & (~head_pos),
+        "NewDisagree": head_wrong & (~trunk_wrong),
+        "ResolvedDisagree": trunk_wrong & (~head_wrong),
+    }
+    distance = (trunk_hu - threshold).abs()
+    return {name: _mask_distance_stats(mask, distance)
+            for name, mask in masks.items()}, masks, distance
+
+
+def _accumulate_event_stats(total, stats, mask, distance):
+    total["count"] += stats["Count"]
+    if not stats["Count"]:
+        return
+    total["distance_sum"] += float(distance[mask].sum())
+    for band in _DISTANCE_BANDS_HU:
+        total["bands"][band] += int((mask & (distance <= band)).sum())
+
+
+def _finalize_event_stats(total, total_pixels):
+    count = total["count"]
+    row = {
+        "Count": count,
+        "pct": 100.0 * count / total_pixels,
+        "MeanDistance_HU": (total["distance_sum"] / count
+                            if count else float("nan")),
+    }
+    for band in _DISTANCE_BANDS_HU:
+        row[f"Within{int(band)}HU_pct"] = (
+            100.0 * total["bands"][band] / count
+            if count else float("nan"))
+    return row
+
+
+def _correction_at_threshold_hu(head, context, threshold, device, dtype):
+    z_threshold = standardize_hu(torch.tensor(
+        threshold, device=device, dtype=dtype)).reshape(1, 1)
+    if isinstance(head, ContextCalibrationHead):
+        corr_z = head.correction(z_threshold, context=context)
+    else:
+        corr_z = head.correction(z_threshold)
+    return float(corr_z.reshape(-1)[0] * BENCHMARK_PIXEL_STD)
+
+
+@torch.no_grad()
+def audit_head_threshold_patient(pid, patient_dir, model, head, device,
+                                 threshold=HEAD_DIAGNOSTIC_THRESHOLD_HU):
+    """Paired trunk/head diagnosis for one fixed physical-HU threshold."""
+    low = sort_by_instance_number(glob(str(patient_dir / "Low_Dose" / "*.dcm")))
+    full = sort_by_instance_number(glob(str(patient_dir / "Full_Dose" / "*.dcm")))
+    if len(low) != len(full):
+        raise RuntimeError(f"[{pid}] slice mismatch: {len(low)} vs {len(full)}")
+    if not low:
+        raise RuntimeError(f"[{pid}] no paired DICOM slices found")
+
+    body = "Chest" if pid.upper().startswith("C") else "Abdomen"
+    names = ("FlipUp", "FlipDown", "NewDisagree", "ResolvedDisagree")
+    totals = {name: {"count": 0, "distance_sum": 0.0,
+                     "bands": {band: 0 for band in _DISTANCE_BANDS_HU}}
+              for name in names}
+    correction_130 = []
+    slice_rows = []
+    total_pixels = 0
+
+    for slice_index, (low_path, full_path) in enumerate(zip(low, full)):
+        low_hu = load_dicom_tensor(low_path).to(device)
+        full_hu = load_dicom_tensor(full_path).to(device).clamp(cfg.A_MIN, cfg.A_MAX)
+        x = standardize_hu(low_hu).unsqueeze(0).unsqueeze(0)
+        trunk_z = model(x)
+        head_z, context = _apply_head(head, x, trunk_z, body)
+        trunk_hu = (denormalize_to_pixel(trunk_z.squeeze()) - cfg.HU_OFFSET).clamp(
+            cfg.A_MIN, cfg.A_MAX)
+        head_hu = (denormalize_to_pixel(head_z.squeeze()) - cfg.HU_OFFSET).clamp(
+            cfg.A_MIN, cfg.A_MAX)
+
+        stats_by_name, masks, distance = _paired_threshold_stats(
+            full_hu, trunk_hu, head_hu, threshold)
+        n_pixels = int(full_hu.numel())
+        total_pixels += n_pixels
+
+        corr_hu = _correction_at_threshold_hu(
+            head, context, threshold, device, trunk_z.dtype)
+        correction_130.append(corr_hu)
+
+        slice_row = {
+            "PatientID": pid,
+            "BodyType": body,
+            "SliceIndex": slice_index,
+            "LowDosePath": str(low_path),
+            "Threshold_HU": threshold,
+            "NumPixels": n_pixels,
+            "CorrectionAt130_HU": corr_hu,
+        }
+        for name, mask in masks.items():
+            stats = stats_by_name[name]
+            _prefixed_stats(slice_row, name, stats)
+            _accumulate_event_stats(totals[name], stats, mask, distance)
+        slice_rows.append(slice_row)
+
+    patient_row = {
+        "PatientID": pid,
+        "BodyType": body,
+        "NumSlices": len(low),
+        "Threshold_HU": threshold,
+        "NumPixels": total_pixels,
+        "MeanCorrectionAt130_HU": sum(correction_130) / len(correction_130),
+        "MinCorrectionAt130_HU": min(correction_130),
+        "MaxCorrectionAt130_HU": max(correction_130),
+    }
+    for name, values in totals.items():
+        _prefixed_stats(
+            patient_row, name, _finalize_event_stats(values, total_pixels))
+    return patient_row, slice_rows
 
 
 @torch.no_grad()
@@ -123,7 +327,8 @@ def audit_patient(pid: str, patient_dir: Path, forward_fn, device):
     acc  = {name: {"w": 0.0, "we": 0.0, "we2": 0.0, "wref": 0.0, "wpred": 0.0}
             for name, _, _ in soft}
     hard = {name: {"n": 0, "e": 0.0} for name, _, _ in TISSUE_BINS}
-    thr  = {t: {"ref_pos": 0, "pred_pos": 0, "disagree": 0, "n": 0}
+    thr  = {t: {"ref_pos": 0, "pred_pos": 0, "false_pos": 0,
+                "false_neg": 0, "disagree": 0, "n": 0}
             for t in THRESHOLDS_HU}
 
     n_id = int((cfg.A_MAX - cfg.A_MIN) / IDENTITY_BIN_WIDTH)
@@ -154,12 +359,9 @@ def audit_patient(pid: str, patient_dir: Path, forward_fn, device):
                 hard[name]["e"] += float(err[mask].sum())
 
         for t in THRESHOLDS_HU:
-            ref_pos  = full_hu > t
-            pred_pos = pred_hu > t
-            thr[t]["ref_pos"]  += int(ref_pos.sum())
-            thr[t]["pred_pos"] += int(pred_pos.sum())
-            thr[t]["disagree"] += int((ref_pos ^ pred_pos).sum())
-            thr[t]["n"]        += int(ref_pos.numel())
+            counts = _threshold_counts(full_hu, pred_hu, t)
+            for key, value in counts.items():
+                thr[t][key] += value
 
         ref_np  = full_hu.detach().cpu().numpy().ravel()
         pred_np = pred_hu.detach().cpu().numpy().ravel()
@@ -206,9 +408,8 @@ def audit_patient(pid: str, patient_dir: Path, forward_fn, device):
     for t in THRESHOLDS_HU:
         d = thr[t]
         tag = f"{int(t)}HU"
-        row[f"ThrDisagree_{tag}_pct"] = 100.0 * d["disagree"] / max(1, d["n"])
-        row[f"ThrRefPos_{tag}_pct"]   = 100.0 * d["ref_pos"]  / max(1, d["n"])
-        row[f"ThrPredPos_{tag}_pct"]  = 100.0 * d["pred_pos"] / max(1, d["n"])
+        for metric, value in _threshold_metrics(d).items():
+            row[f"Thr{metric.replace('_pct', '')}_{tag}_pct"] = value
 
     return row, id_count, id_sum
 
@@ -286,6 +487,7 @@ def main():
     # is kept so oracle heads can receive the ground-truth body type per
     # patient.
     targets = []
+    head_diagnostics = []
     if args.include_input:
         targets.append(("input", "LDCT input", input_forward, None))
     for arch in [a.strip() for a in args.archs.split(",") if a.strip()]:
@@ -304,7 +506,8 @@ def main():
                     print(f"  {arch}: ORACLE head detected -- ground-truth "
                           "body type will be fed per patient.")
                 targets.append((f"{arch}_head", f"{label} + Head",
-                                make_model_forward(model, head), head))
+                                 make_model_forward(model, head), head))
+                head_diagnostics.append((arch, model, head))
             else:
                 print(f"  No head for {arch}: {head_ckpt} not found")
 
@@ -343,6 +546,21 @@ def main():
             "PixelCount":   id_count,
             "MeanPred_HU":  mean_pred,
         }).to_csv(out_path / f"{key}_identity_curve.csv", index=False)
+
+    for arch, model, head in head_diagnostics:
+        print(f"\nDiagnosing {ARCH_MAP.get(arch, arch)} + Head at "
+              f"{HEAD_DIAGNOSTIC_THRESHOLD_HU:.0f} HU ...")
+        patient_rows = []
+        slice_rows = []
+        for patient_dir in test_patients:
+            patient_row, patient_slices = audit_head_threshold_patient(
+                patient_dir.name, patient_dir, model, head, device)
+            patient_rows.append(patient_row)
+            slice_rows.extend(patient_slices)
+        pd.DataFrame(patient_rows).to_csv(
+            out_path / f"{arch}_head_threshold_130_patient.csv", index=False)
+        pd.DataFrame(slice_rows).to_csv(
+            out_path / f"{arch}_head_threshold_130_slice.csv", index=False)
 
     print_summary(all_dfs)
 
