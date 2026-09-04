@@ -15,14 +15,20 @@ Units.
   [physics-faithful-ldct-denoising](https://github.com/BrahimSoufghalem/physics-faithful-ldct-denoising)
 - [x] **Phase 1 — Audit** — completed on MSE baselines (RED-CNN + ResNet,
   10 test patients)
-- [ ] **Phase 2 — HU losses (arms B, C)** ← current step (`hu_losses.py`, `train.py`)
-- [ ] Phase 3 — Post-hoc calibration head (arm D)
-- [ ] Phase 4 — Context-conditioned head (E), full (F), matched-weight control (G)
+- [x] **Phase 2 — HU losses (arms B, C)** — naive HU L1 did not remove bias;
+  explicit calibration loss improved chest bias but overshot in abdomen
+- [x] **Phase 3 — Post-hoc calibration head (arm D)** — bounded and monotone,
+  but one global curve remained anatomy-blind
+- [x] **Phase 4 — Context-conditioned head (arm E)** — patch context remained
+  blind; full-slice image-derived context restored anatomy-sensitive correction
+- [x] **E-full-slice replication** — three head seeds on RED-CNN and ResNet
+- [ ] Context-aware quality evaluation and isolated loss ablation
+- [ ] Full combination (arm F) and matched-weight control (arm G)
 
 Staged philosophy: **Audit → Loss → Post-hoc Head → Context → Adaptive only if
 needed.** Every arm must be justified by the results of the previous one.
 
-### Phase-1 findings (why arms B–D are justified)
+### Current findings
 
 - The HU distortion is **architecture-independent**: RED-CNN and ResNet show
   nearly identical identity-deviation curves (bias-sign agreement in 43/50
@@ -37,6 +43,16 @@ needed.** Every arm must be justified by the results of the previous one.
 - Bias explains up to **27.6 % of per-bin MSE** (chest FatLow) → a
   calibration head has a real theoretical ceiling; variance dominates
   elsewhere → training-time losses (arms B/C) target the remainder.
+- Patch-derived context heads converged to the analytical ceiling of an
+  anatomy-blind correction. On Bone, the predicted residuals were about
+  −24.32 / +24.32 HU (chest / abdomen), versus −24.97 / +23.73 measured.
+- Computing the same seven context statistics from the uncropped low-dose
+  slice broke this ceiling. Across three head seeds, Bone SoftBias changed by
+  +43.44 HU for RED-CNN chest and +43.75 HU for ResNet chest. Non-circular
+  HardBias Bone improved consistently as well.
+- The gain has a measured cost: `ThrDisagree_130HU_pct` increased for both
+  anatomies and both architectures. Image-quality preservation is therefore
+  not assumed; it must be measured explicitly against the frozen trunk.
 
 ## Experiment arms
 
@@ -46,11 +62,13 @@ needed.** Every arm must be justified by the results of the previous one.
 | B | + `L_HU` (control: is plain HU supervision enough?) |
 | C | + `L_HU-Cal` = soft-bin bias + slope/intercept penalty (α→1, β→0) |
 | D | A + post-hoc calibration head `T(x) = x + δ·tanh(g(x))`, frozen trunk |
-| E | Joint context-conditioned head + anti-collapse constraint |
+| E | Post-hoc context-conditioned head; patch and full-slice variants |
 | F | Full: C + head |
 | G | Matched-weight control |
 
-**Trunks:** RED-CNN and ResNet (both mandatory for every arm). Seeds 0/1/2.
+**Trunks:** RED-CNN and ResNet. E-full-slice uses three repeated head fits per
+architecture over one fixed trunk checkpoint; these are head seeds, not
+independent trunk replications.
 Head guarantees by construction: bounded correction, monotonicity,
 near-identity init; water anchor `T(0) ≈ 0` is a *tested* constraint, not an
 assumption.
@@ -66,7 +84,7 @@ assumption.
 | `metrics.py` | RMSE (HU), clinically-windowed PSNR/SSIM, VIF |
 | `hu_losses.py` | **Arms B/C** — `L_HU` control and `L_HU-Cal` (soft-bin bias + α/β) |
 | `train.py` | Matched-budget trainer (arms A, B, C) |
-| `evaluate_image.py` | Standard image-quality evaluation |
+| `evaluate_image.py` | Full-resolution PSNR/SSIM/RMSE_HU/VIF; optional paired Cycle-00 vs selected-head evaluation |
 | `hu_audit.py` | **Phase 1** — tissue-resolved HU audit |
 | `twenty_patient_split.py` | Balanced 20-patient pilot split |
 
@@ -89,6 +107,16 @@ HU_RANGE_PRESET=benchmark python train.py --arch redcnn \
 #   ... --hu-weight 0.2 --output-root runs_armB
 # Arm C (+L_HU-Cal):
 #   ... --hucal-weight 0.2 --output-root runs_armC
+
+# Post-hoc E-full-slice head:
+HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \
+    --data-dir dataset --split 100p --head-type context \
+    --context-full-slice --output-root runs_armE_full_slice
+
+# Tissue-resolved audit of the frozen trunk and selected head:
+HU_RANGE_PRESET=benchmark python hu_audit.py --test-dir test \
+    --runs-root runs --heads-root runs_armE_full_slice \
+    --archs redcnn --include-input --output hu_audit_e_full_slice
 ```
 
 `hu_audit.py` reports, per patient and per tissue bin (AirLung / FatLow /
@@ -100,6 +128,46 @@ Soft / Dense / Bone, Gaussian soft membership):
 - threshold-crossing sensitivity (fraction of pixels flipping across fixed HU
   thresholds — a sensitivity analysis, **not** a clinical endpoint claim),
 - identity-curve data (`HU_pred` vs `HU_ref`) exported to CSV for plotting.
+
+## Context-aware image-quality evaluation
+
+`evaluate_image.py` can evaluate a post-hoc calibration head and its frozen
+trunk in the same full-resolution test pass. This closes the previous gap in
+which generic validation could not pass explicit full-slice context.
+
+```bash
+HU_RANGE_PRESET=benchmark python evaluate_image.py \
+    --test-dir test \
+    --runs-root runs \
+    --heads-root runs_armE_full_slice \
+    --archs redcnn \
+    --split 100p \
+    --output eval_armE_full_slice
+```
+
+The evaluator:
+
+- reports clinically windowed PSNR/SSIM, physical-HU RMSE, and VIF per patient;
+- computes full-slice context from the uncropped standardized low-dose input,
+  matching training and `hu_audit.py`;
+- supports intensity, inferred-context, full-slice-context, and oracle heads;
+- writes the frozen trunk as `Cycle 00` and the selected head separately;
+- reports deltas against both the raw LDCT input and the frozen trunk;
+- validates architecture, normalization constants, data split, and exact trunk
+  checkpoint provenance before accepting a head;
+- rejects joint heads because they do not share the post-hoc Cycle-00 baseline;
+- fails if `--heads-root` is requested but a paired head checkpoint is missing.
+
+Outputs are:
+
+- `<arch>_results.csv`: frozen-trunk / Cycle-00 patient metrics;
+- `<arch>_head_results.csv`: selected-head metrics and deltas versus the trunk;
+- `comparison.csv`: all evaluated stages and architectures.
+
+For `Delta_vs_Trunk_RMSE_HU`, a negative value is an improvement. For PSNR,
+SSIM, and VIF, a positive value is an improvement. Quality results must not be
+claimed until this evaluator has been run on the actual test data and selected
+checkpoints.
 
 ## Protocol
 
