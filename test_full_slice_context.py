@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import torch
 
@@ -15,9 +16,14 @@ from evaluate_image import (
 from hu_audit import (
     _accumulate_event_stats, _correction_at_threshold_hu,
     _finalize_event_stats, _mask_distance_stats, _paired_threshold_stats,
-    _threshold_counts, _threshold_metrics,
+    _threshold_counts, _threshold_counts_grid, _threshold_metrics,
+    _threshold_tag,
 )
-from train_head import batch_context
+from hu_losses import threshold_no_harm_loss
+from train_head import (
+    batch_context, curve_regularization, sampled_threshold_pixels,
+    sampled_thresholds,
+)
 
 
 def test_context_precedes_patch_crop():
@@ -137,6 +143,24 @@ def test_threshold_counts_report_error_direction():
     assert metrics["FalseNegativeRate_pct"] == 50.0
 
 
+def test_threshold_grid_matches_individual_counts():
+    ref = torch.tensor([-10.0, 0.0, 10.0, 20.0])
+    pred = torch.tensor([10.0, -10.0, 10.0, 30.0])
+    thresholds = (-5.0, 0.0, 5.0, 20.0)
+    grid = _threshold_counts_grid(ref, pred, thresholds)
+    for threshold in thresholds:
+        assert grid[threshold] == _threshold_counts(ref, pred, threshold)
+
+
+def test_threshold_grid_preserves_fractional_strict_boundaries():
+    threshold = torch.tensor(0.1, dtype=torch.float32)
+    ref = torch.tensor([threshold, threshold + 0.01, threshold - 0.01])
+    pred = torch.tensor([threshold + 0.01, threshold, threshold])
+    grid = _threshold_counts_grid(ref, pred, (0.1,))
+    assert grid[0.1] == _threshold_counts(ref, pred, 0.1)
+    assert _threshold_tag(0.1) != _threshold_tag(0.9)
+
+
 def test_threshold_distance_stats_use_pre_head_values():
     mask = torch.tensor([True, True, False, False])
     distance = torch.tensor([0.5, 7.0, 0.1, 0.1])
@@ -200,6 +224,70 @@ def test_threshold_correction_is_converted_to_hu():
     assert abs(got - expected) < 1e-5
 
 
+def test_threshold_no_harm_penalizes_only_regression():
+    target = standardize_hu(torch.tensor([-20.0, 20.0]))
+    trunk = standardize_hu(torch.tensor([-20.0, 20.0]))
+    worse = standardize_hu(torch.tensor([20.0, 20.0])).requires_grad_()
+    thresholds = torch.tensor([0.0])
+
+    identity_loss = threshold_no_harm_loss(
+        trunk, trunk, target, thresholds, temperature_hu=1.0)
+    worse_loss = threshold_no_harm_loss(
+        worse, trunk, target, thresholds, temperature_hu=1.0)
+
+    assert identity_loss == 0.0
+    assert worse_loss > 0.4
+    worse_loss.backward()
+    assert worse.grad is not None
+
+    close_target = standardize_hu(torch.tensor([0.1]))
+    correct_trunk = standardize_hu(torch.tensor([10.0]))
+    wrong_head = standardize_hu(torch.tensor([-0.1]))
+    crossing_loss = threshold_no_harm_loss(
+        wrong_head, correct_trunk, close_target, thresholds,
+        temperature_hu=1.0)
+    assert crossing_loss > 0.0
+
+
+def test_threshold_sampling_is_deterministic_for_validation():
+    args = SimpleNamespace(
+        threshold_samples=4, threshold_min_hu=-100.0,
+        threshold_max_hu=200.0)
+    reference = torch.zeros(1)
+    got = sampled_thresholds(args, reference, training=False)
+    assert torch.equal(got, torch.tensor([-100.0, 0.0, 100.0, 200.0]))
+
+
+def test_threshold_pixel_sampling_keeps_tensors_aligned():
+    pred = torch.arange(20.0)
+    trunk = pred + 100.0
+    target = pred + 200.0
+    p, z, y = sampled_threshold_pixels(
+        pred, trunk, target, max_pixels=5, training=False)
+    assert p.numel() == 5
+    assert torch.equal(z - p, torch.full((5,), 100.0))
+    assert torch.equal(y - p, torch.full((5,), 200.0))
+
+
+def test_curve_regularization_detects_broad_correction():
+    args = SimpleNamespace(
+        threshold_min_hu=-1000.0, threshold_max_hu=1500.0,
+        curve_grid_points=32)
+    reference = torch.zeros(1)
+    identity_head = ContextCalibrationHead(full_slice_context=True)
+    context = torch.zeros(1, identity_head.context_dim)
+    identity, slope = curve_regularization(
+        identity_head, reference, args, ctx=context)
+    assert identity == 0.0
+    assert slope == 0.0
+
+    torch.nn.init.constant_(identity_head.fc3.bias, 0.25)
+    shifted, shifted_slope = curve_regularization(
+        identity_head, reference, args, ctx=context)
+    assert shifted > 0.0
+    assert shifted_slope >= 0.0
+
+
 if __name__ == "__main__":
     test_context_precedes_patch_crop()
     test_batch_context_uses_full_slice_statistics_not_patch()
@@ -208,8 +296,14 @@ if __name__ == "__main__":
     test_evaluator_reports_deltas_against_cycle_zero()
     test_evaluator_rejects_mismatched_head_provenance()
     test_threshold_counts_report_error_direction()
+    test_threshold_grid_matches_individual_counts()
+    test_threshold_grid_preserves_fractional_strict_boundaries()
     test_threshold_distance_stats_use_pre_head_values()
     test_paired_threshold_stats_classify_head_changes()
     test_patient_event_aggregation_is_pixel_weighted()
     test_threshold_correction_is_converted_to_hu()
+    test_threshold_no_harm_penalizes_only_regression()
+    test_threshold_sampling_is_deterministic_for_validation()
+    test_threshold_pixel_sampling_keeps_tensors_aligned()
+    test_curve_regularization_detects_broad_correction()
     print("full-slice-context checks: OK")

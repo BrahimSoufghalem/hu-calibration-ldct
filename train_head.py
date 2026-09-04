@@ -105,7 +105,7 @@ from calibration_head import (
     CalibrationHead, ContextCalibrationHead, save_head,
 )
 from evaluate_image import load_checkpoint
-from hu_losses import HUCalLoss, BIN_NAMES
+from hu_losses import HUCalLoss, BIN_NAMES, threshold_no_harm_loss
 from models import ARCH_CHOICES, build_benchmark_model
 from train import apply_split, validate, selection_score
 from utils import setup_reproducibility, get_device, get_state_dict
@@ -193,6 +193,27 @@ def parse_args():
                         "only): per-image mean correction -> 0.")
     p.add_argument("--water-anchor-lambda", type=float, default=0.0,
                    help="lambda_w for |T(0 HU)|^2 (0 = anchor off).")
+    p.add_argument("--threshold-no-harm-lambda", type=float, default=0.0,
+                   help="Penalize soft threshold-disagreement regression "
+                        "versus the trunk over sampled HU thresholds.")
+    p.add_argument("--threshold-min-hu", type=float, default=-1000.0)
+    p.add_argument("--threshold-max-hu", type=float, default=1500.0)
+    p.add_argument("--threshold-samples", type=int, default=16,
+                   help="Random thresholds per training batch; validation "
+                        "uses an evenly spaced grid of the same size.")
+    p.add_argument("--threshold-pixel-samples", type=int, default=65536,
+                   help="Maximum pixels sampled per batch for the threshold "
+                        "loss, to bound memory use.")
+    p.add_argument("--threshold-temperature-hu", type=float, default=5.0,
+                   help="Sigmoid temperature for differentiable crossings.")
+    p.add_argument("--threshold-worst-weight", type=float, default=1.0,
+                   help="Weight of the worst sampled threshold in addition "
+                        "to the mean threshold regression.")
+    p.add_argument("--curve-identity-lambda", type=float, default=0.0,
+                   help="Penalize mean squared correction over an HU grid.")
+    p.add_argument("--curve-slope-lambda", type=float, default=0.0,
+                   help="Penalize squared correction slope over an HU grid.")
+    p.add_argument("--curve-grid-points", type=int, default=128)
 
     p.add_argument("--select-by", choices=list(_SELECT_CHOICES),
                    default="val_loss",
@@ -242,7 +263,57 @@ def hucal_term(pred, target, hucal, reduction):
     return total / max(1, b)
 
 
-def objective(z, corr, target, head, args, hucal, ctx=None):
+def sampled_thresholds(args, reference: torch.Tensor,
+                       training: bool) -> torch.Tensor:
+    """Random training thresholds and deterministic validation thresholds."""
+    if training:
+        thresholds = torch.rand(args.threshold_samples, device=reference.device,
+                                dtype=reference.dtype)
+        return args.threshold_min_hu + thresholds * (
+            args.threshold_max_hu - args.threshold_min_hu)
+    return torch.linspace(args.threshold_min_hu, args.threshold_max_hu,
+                          args.threshold_samples, device=reference.device,
+                          dtype=reference.dtype)
+
+
+def sampled_threshold_pixels(pred, trunk, target, max_pixels, training):
+    """Select matching pixels without materializing threshold-by-image tensors."""
+    pred = pred.reshape(-1)
+    trunk = trunk.reshape(-1)
+    target = target.reshape(-1)
+    if pred.numel() <= max_pixels:
+        return pred, trunk, target
+    if training:
+        indices = torch.randint(pred.numel(), (max_pixels,), device=pred.device)
+    else:
+        indices = torch.linspace(0, pred.numel() - 1, max_pixels,
+                                 device=pred.device).long()
+    return pred[indices], trunk[indices], target[indices]
+
+
+def curve_regularization(head, reference: torch.Tensor, args, ctx=None):
+    """Return identity and slope penalties on the whole configured HU range."""
+    hu = torch.linspace(args.threshold_min_hu, args.threshold_max_hu,
+                        args.curve_grid_points, device=reference.device,
+                        dtype=reference.dtype)
+    z_grid = ((hu + cfg.HU_OFFSET - BENCHMARK_PIXEL_MEAN)
+              / BENCHMARK_PIXEL_STD)
+    if isinstance(head, ContextCalibrationHead):
+        if ctx is None:
+            raise ValueError("context is required for context-curve regularization")
+        grid = z_grid.reshape(1, -1).expand(ctx.shape[0], -1)
+        curve_corr = head.correction(grid, context=ctx)
+    else:
+        grid = z_grid.reshape(1, -1)
+        curve_corr = head.correction(grid)
+
+    identity = curve_corr.square().mean()
+    dz = z_grid[1:] - z_grid[:-1]
+    slope = ((curve_corr[..., 1:] - curve_corr[..., :-1]) / dz).square().mean()
+    return identity, slope
+
+
+def objective(z, corr, target, head, args, hucal, ctx=None, training=True):
     pred = z + corr
     loss = args.mse_weight * F.mse_loss(pred, target)
     if args.hucal_weight > 0.0:
@@ -257,6 +328,19 @@ def objective(z, corr, target, head, args, hucal, ctx=None):
         else:
             anchor = head.water_anchor_penalty()
         loss = loss + args.water_anchor_lambda * anchor
+    if args.threshold_no_harm_lambda > 0.0:
+        thresholds = sampled_thresholds(args, pred, training)
+        threshold_pred, threshold_trunk, threshold_target = \
+            sampled_threshold_pixels(
+                pred, z, target, args.threshold_pixel_samples, training)
+        loss = loss + args.threshold_no_harm_lambda * threshold_no_harm_loss(
+            threshold_pred, threshold_trunk, threshold_target, thresholds,
+            temperature_hu=args.threshold_temperature_hu,
+            worst_weight=args.threshold_worst_weight)
+    if args.curve_identity_lambda > 0.0 or args.curve_slope_lambda > 0.0:
+        identity, slope = curve_regularization(head, pred, args, ctx=ctx)
+        loss = (loss + args.curve_identity_lambda * identity
+                + args.curve_slope_lambda * slope)
     return loss
 
 
@@ -391,7 +475,8 @@ def validation_objective(trunk, head, loader, device, args, hucal):
         y = batch["label"].to(device, non_blocking=True)
         z = trunk(x)
         corr, ctx = compute_correction(head, batch, z)
-        total += float(objective(z, corr, y, head, args, hucal, ctx=ctx))
+        total += float(objective(z, corr, y, head, args, hucal, ctx=ctx,
+                                 training=False))
         count += 1
     return total / max(1, count)
 
@@ -423,6 +508,20 @@ def main():
         print("  WARNING: --joint with a tiny budget "
               f"({args.max_iterations} iters). For reportable joint runs "
               "use the matched budget (30000).")
+    if args.threshold_samples < 2:
+        raise ValueError("--threshold-samples must be >= 2")
+    if args.threshold_pixel_samples < 1:
+        raise ValueError("--threshold-pixel-samples must be >= 1")
+    if args.curve_grid_points < 2:
+        raise ValueError("--curve-grid-points must be >= 2")
+    if args.threshold_min_hu >= args.threshold_max_hu:
+        raise ValueError("--threshold-min-hu must be less than --threshold-max-hu")
+    for name in ("threshold_no_harm_lambda", "threshold_worst_weight",
+                 "curve_identity_lambda", "curve_slope_lambda"):
+        if getattr(args, name) < 0.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
+    if args.threshold_temperature_hu <= 0.0:
+        raise ValueError("--threshold-temperature-hu must be > 0")
 
     hucal_bin_weights = None
     if args.hucal_bin_weights is not None:
@@ -488,6 +587,15 @@ def main():
         loss_desc += f" + {args.center_lambda}*Center"
     if args.water_anchor_lambda > 0.0:
         loss_desc += f" + {args.water_anchor_lambda}*WaterAnchor"
+    if args.threshold_no_harm_lambda > 0.0:
+        loss_desc += (f" + {args.threshold_no_harm_lambda}*ThresholdNoHarm"
+                      f"[{args.threshold_samples} in "
+                      f"{args.threshold_min_hu:g}:{args.threshold_max_hu:g} HU, "
+                      f"worst={args.threshold_worst_weight:g}]")
+    if args.curve_identity_lambda > 0.0:
+        loss_desc += f" + {args.curve_identity_lambda}*CurveIdentity"
+    if args.curve_slope_lambda > 0.0:
+        loss_desc += f" + {args.curve_slope_lambda}*CurveSlope"
 
     print(f"\n{'='*68}")
     print(f"  CALIBRATION HEAD TRAINING \u2014 study arm: {arm}")
@@ -617,6 +725,16 @@ def main():
             "hucal_bin_weights":      hucal_bin_weights,
             "center_lambda":          args.center_lambda,
             "water_anchor_lambda":    args.water_anchor_lambda,
+            "threshold_no_harm_lambda": args.threshold_no_harm_lambda,
+            "threshold_min_hu": args.threshold_min_hu,
+            "threshold_max_hu": args.threshold_max_hu,
+            "threshold_samples": args.threshold_samples,
+            "threshold_pixel_samples": args.threshold_pixel_samples,
+            "threshold_temperature_hu": args.threshold_temperature_hu,
+            "threshold_worst_weight": args.threshold_worst_weight,
+            "curve_identity_lambda": args.curve_identity_lambda,
+            "curve_slope_lambda": args.curve_slope_lambda,
+            "curve_grid_points": args.curve_grid_points,
             "budget_iterations": args.max_iterations,
             "select_by":       args.select_by,
             "normalization":   "benchmark_meanstd",
@@ -626,6 +744,7 @@ def main():
             "hu_preset":       cfg.HU_RANGE_PRESET,
             "eval_data_range": cfg.EVAL_DATA_RANGE,
             "loss":            loss_desc,
+            "training_args":   vars(args).copy(),
         }
         extra = {"meta": meta, "iteration": iteration, "score": score,
                  "select_by": args.select_by, "val_objective": val_obj,

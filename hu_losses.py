@@ -69,6 +69,41 @@ def hu_mae_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(pred, target)
 
 
+def threshold_no_harm_loss(pred: torch.Tensor, trunk: torch.Tensor,
+                           target: torch.Tensor, thresholds_hu: torch.Tensor,
+                           temperature_hu: float = 5.0,
+                           worst_weight: float = 1.0) -> torch.Tensor:
+    """Penalize threshold disagreement regressions relative to the trunk.
+
+    Thresholds can span the full HU range rather than encoding one clinical
+    cutoff. A sigmoid makes each threshold comparison differentiable. The
+    mean term protects the complete sampled range while the maximum term
+    prevents one bad threshold from being hidden by that average.
+    """
+    if temperature_hu <= 0.0:
+        raise ValueError("temperature_hu must be > 0")
+    if worst_weight < 0.0:
+        raise ValueError("worst_weight must be >= 0")
+    thresholds = thresholds_hu.reshape(-1)
+    if thresholds.numel() == 0:
+        raise ValueError("thresholds_hu must not be empty")
+
+    pred_hu = to_hu(pred)
+    trunk_hu = to_hu(trunk.detach())
+    target_hu = to_hu(target.detach())
+    regressions = []
+    for threshold in thresholds:
+        target_pos = (target_hu > threshold).to(dtype=pred_hu.dtype)
+        pred_pos = torch.sigmoid((pred_hu - threshold) / temperature_hu)
+        trunk_pos = torch.sigmoid((trunk_hu - threshold) / temperature_hu)
+        head_disagree = (pred_pos - target_pos).abs().mean()
+        trunk_disagree = (trunk_pos - target_pos).abs().mean()
+        regressions.append(F.relu(head_disagree - trunk_disagree))
+
+    regressions = torch.stack(regressions)
+    return regressions.mean() + worst_weight * regressions.max()
+
+
 def soft_bin_weights(ref_hu: torch.Tensor):
     """Yield (name, weight-map) Gaussian soft memberships from reference HU."""
     for name, lo, hi in TISSUE_BINS:

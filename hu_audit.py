@@ -45,6 +45,7 @@ HU_RANGE_PRESET=benchmark python hu_audit.py \\
 """
 
 import argparse
+import json
 from glob import glob
 from pathlib import Path
 
@@ -58,7 +59,9 @@ from benchmark_data import (
     BENCHMARK_PIXEL_STD, denormalize_to_pixel, standardize_hu,
 )
 from calibration_head import ContextCalibrationHead, load_head
-from evaluate_image import ARCH_MAP, get_test_set, load_checkpoint
+from evaluate_image import (
+    ARCH_MAP, _head_checkpoint_meta, get_test_set, load_checkpoint,
+)
 from utils import (
     load_dicom_tensor, setup_reproducibility, get_device,
     sort_by_instance_number,
@@ -135,6 +138,49 @@ def _threshold_metrics(counts):
         "FalseNegativeRate_pct": (100.0 * counts["false_neg"] / ref_pos
                                   if ref_pos else float("nan")),
     }
+
+
+def _threshold_counts_grid(ref_hu, pred_hu, thresholds):
+    """Exact crossing counts for a sorted threshold grid in one vectorized pass."""
+    output_thresholds = np.asarray(thresholds, dtype=np.float64)
+    if output_thresholds.ndim != 1 or output_thresholds.size == 0:
+        raise ValueError("thresholds must be a non-empty one-dimensional grid")
+    if np.any(np.diff(output_thresholds) <= 0):
+        raise ValueError("thresholds must be strictly increasing")
+
+    ref = ref_hu.detach().cpu().numpy().reshape(-1)
+    pred = pred_hu.detach().cpu().numpy().reshape(-1)
+    thresholds = output_thresholds.astype(ref.dtype)
+    n = ref.size
+    ref_pos = n - np.searchsorted(np.sort(ref), thresholds, side="right")
+    pred_pos = n - np.searchsorted(np.sort(pred), thresholds, side="right")
+
+    def interval_counts(low, high):
+        starts = np.searchsorted(thresholds, low, side="left")
+        stops = np.searchsorted(thresholds, high, side="left")
+        delta = (np.bincount(starts, minlength=thresholds.size + 1)
+                 - np.bincount(stops, minlength=thresholds.size + 1))
+        return np.cumsum(delta)[:thresholds.size]
+
+    upward = pred > ref
+    downward = ref > pred
+    false_pos = interval_counts(ref[upward], pred[upward])
+    false_neg = interval_counts(pred[downward], ref[downward])
+    return {
+        float(threshold): {
+            "ref_pos": int(ref_pos[i]),
+            "pred_pos": int(pred_pos[i]),
+            "false_pos": int(false_pos[i]),
+            "false_neg": int(false_neg[i]),
+            "disagree": int(false_pos[i] + false_neg[i]),
+            "n": int(n),
+        }
+        for i, threshold in enumerate(output_thresholds)
+    }
+
+
+def _threshold_tag(threshold):
+    return f"{float(threshold):.12g}HU"
 
 
 def make_model_forward(model, head=None, body=None):
@@ -315,7 +361,8 @@ def audit_head_threshold_patient(pid, patient_dir, model, head, device,
 
 
 @torch.no_grad()
-def audit_patient(pid: str, patient_dir: Path, forward_fn, device):
+def audit_patient(pid: str, patient_dir: Path, forward_fn, device,
+                  thresholds_hu=THRESHOLDS_HU):
     low  = sort_by_instance_number(glob(str(patient_dir / "Low_Dose"  / "*.dcm")))
     full = sort_by_instance_number(glob(str(patient_dir / "Full_Dose" / "*.dcm")))
     if len(low) != len(full):
@@ -329,7 +376,7 @@ def audit_patient(pid: str, patient_dir: Path, forward_fn, device):
     hard = {name: {"n": 0, "e": 0.0} for name, _, _ in TISSUE_BINS}
     thr  = {t: {"ref_pos": 0, "pred_pos": 0, "false_pos": 0,
                 "false_neg": 0, "disagree": 0, "n": 0}
-            for t in THRESHOLDS_HU}
+            for t in thresholds_hu}
 
     n_id = int((cfg.A_MAX - cfg.A_MIN) / IDENTITY_BIN_WIDTH)
     id_count = np.zeros(n_id, dtype=np.float64)
@@ -358,8 +405,10 @@ def audit_patient(pid: str, patient_dir: Path, forward_fn, device):
                 hard[name]["n"] += n
                 hard[name]["e"] += float(err[mask].sum())
 
-        for t in THRESHOLDS_HU:
-            counts = _threshold_counts(full_hu, pred_hu, t)
+        threshold_counts = _threshold_counts_grid(
+            full_hu, pred_hu, thresholds_hu)
+        for t in thresholds_hu:
+            counts = threshold_counts[float(t)]
             for key, value in counts.items():
                 thr[t][key] += value
 
@@ -405,9 +454,9 @@ def audit_patient(pid: str, patient_dir: Path, forward_fn, device):
         row["CalibSlope_alpha"]    = float("nan")
         row["CalibIntercept_beta"] = float("nan")
 
-    for t in THRESHOLDS_HU:
+    for t in thresholds_hu:
         d = thr[t]
-        tag = f"{int(t)}HU"
+        tag = _threshold_tag(t)
         for metric, value in _threshold_metrics(d).items():
             row[f"Thr{metric.replace('_pct', '')}_{tag}_pct"] = value
 
@@ -416,8 +465,9 @@ def audit_patient(pid: str, patient_dir: Path, forward_fn, device):
 
 def print_summary(all_dfs: dict):
     metrics = ["SoftBias_AirLung", "SoftBias_Soft", "SoftBias_Bone",
-               "CalibSlope_alpha", "CalibIntercept_beta",
-               "ThrDisagree_130HU_pct"]
+               "CalibSlope_alpha", "CalibIntercept_beta"]
+    if all("ThrDisagree_130HU_pct" in df.columns for df in all_dfs.values()):
+        metrics.append("ThrDisagree_130HU_pct")
     ideal = {"SoftBias_AirLung": "0 HU", "SoftBias_Soft": "0 HU",
              "SoftBias_Bone": "0 HU", "CalibSlope_alpha": "1.000",
              "CalibIntercept_beta": "0.00", "ThrDisagree_130HU_pct": "0 %"}
@@ -454,11 +504,31 @@ def main():
     p.add_argument("--heads-root", default=None,
                    help="Arms D/E: root dir with <arch>/best_head.pt "
                         "calibration heads. Adds a '<Model> + Head' target "
-                        "next to each bare trunk.")
+                         "next to each bare trunk.")
+    p.add_argument("--threshold-grid", default=None, metavar="MIN,MAX,STEP",
+                   help="Audit an inclusive dense HU threshold grid instead "
+                        "of the legacy -950,0,100,130 thresholds.")
     args = p.parse_args()
 
     if cfg.HU_RANGE_PRESET != "benchmark":
         raise RuntimeError("Run with HU_RANGE_PRESET=benchmark.")
+
+    thresholds_hu = THRESHOLDS_HU
+    if args.threshold_grid is not None:
+        try:
+            threshold_min, threshold_max, threshold_step = (
+                float(value) for value in args.threshold_grid.split(","))
+        except ValueError as error:
+            raise ValueError("--threshold-grid must be MIN,MAX,STEP") from error
+        if threshold_min >= threshold_max or threshold_step <= 0.0:
+            raise ValueError("--threshold-grid requires MIN < MAX and STEP > 0")
+        intervals = (threshold_max - threshold_min) / threshold_step
+        rounded_intervals = round(intervals)
+        if not np.isclose(intervals, rounded_intervals, rtol=0.0, atol=1e-9):
+            raise ValueError(
+                "--threshold-grid STEP must divide MAX-MIN for an inclusive grid")
+        thresholds_hu = tuple(np.linspace(
+            threshold_min, threshold_max, rounded_intervals + 1))
 
     setup_reproducibility()
     device   = get_device()
@@ -501,6 +571,7 @@ def main():
         if args.heads_root:
             head_ckpt = Path(args.heads_root) / arch / "best_head.pt"
             if head_ckpt.exists():
+                _head_checkpoint_meta(head_ckpt, arch, ckpt, args.split)
                 head = load_head(str(head_ckpt), device)
                 if getattr(head, "oracle", False):
                     print(f"  {arch}: ORACLE head detected -- ground-truth "
@@ -515,6 +586,26 @@ def main():
         print("Nothing to audit. Train baselines first or pass --include-input.")
         return
 
+
+    manifest = {
+        "arguments": vars(args),
+        "effective_thresholds_hu": [float(t) for t in thresholds_hu],
+        "targets": [key for key, _, _, _ in targets],
+        "trunk_checkpoints": {
+            arch: str((Path(args.runs_root) / arch / "best_model.pt").resolve())
+            for arch in [a.strip() for a in args.archs.split(",") if a.strip()]
+            if (Path(args.runs_root) / arch / "best_model.pt").exists()
+        },
+        "head_checkpoints": {
+            arch: str((Path(args.heads_root) / arch / "best_head.pt").resolve())
+            for arch in [a.strip() for a in args.archs.split(",") if a.strip()]
+            if args.heads_root
+            and (Path(args.heads_root) / arch / "best_head.pt").exists()
+        },
+    }
+    with open(out_path / "audit_manifest.json", "w", encoding="ascii") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+
     n_id = int((cfg.A_MAX - cfg.A_MIN) / IDENTITY_BIN_WIDTH)
     centers = cfg.A_MIN + (np.arange(n_id) + 0.5) * IDENTITY_BIN_WIDTH
 
@@ -528,7 +619,8 @@ def main():
             if head is not None and getattr(head, "oracle", False):
                 head.oracle_body = ("Chest" if d.name.upper().startswith("C")
                                     else "Abdomen")
-            row, c, s = audit_patient(d.name, d, forward_fn, device)
+            row, c, s = audit_patient(
+                d.name, d, forward_fn, device, thresholds_hu=thresholds_hu)
             rows.append(row)
             id_count += c
             id_sum   += s
