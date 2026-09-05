@@ -249,13 +249,37 @@ def test_threshold_no_harm_penalizes_only_regression():
     assert crossing_loss > 0.0
 
 
+def test_threshold_no_harm_cannot_cancel_harm_between_images():
+    target = standardize_hu(torch.tensor([[-10.0], [10.0]]))
+    trunk = standardize_hu(torch.tensor([[-10.0], [-10.0]]))
+    head = standardize_hu(torch.tensor([[10.0], [10.0]]))
+    loss = threshold_no_harm_loss(
+        head, trunk, target, torch.tensor([0.0]), temperature_hu=1.0,
+        cvar_fraction=1.0)
+    assert loss > 0.4
+
+
 def test_threshold_sampling_is_deterministic_for_validation():
     args = SimpleNamespace(
         threshold_samples=4, threshold_min_hu=-100.0,
-        threshold_max_hu=200.0)
+        threshold_max_hu=200.0, threshold_density_fraction=0.0)
     reference = torch.zeros(1)
     got = sampled_thresholds(args, reference, training=False)
     assert torch.equal(got, torch.tensor([-100.0, 0.0, 100.0, 200.0]))
+
+
+def test_zero_cvar_fraction_preserves_legacy_maximum():
+    target = standardize_hu(torch.tensor([[-10.0, 10.0]]))
+    trunk = target.clone()
+    head = standardize_hu(torch.tensor([[10.0, 10.0]]))
+    thresholds = torch.tensor([0.0, 1000.0])
+    legacy = threshold_no_harm_loss(
+        head, trunk, target, thresholds, temperature_hu=1.0,
+        worst_weight=1.0, cvar_fraction=0.0)
+    half_cvar = threshold_no_harm_loss(
+        head, trunk, target, thresholds, temperature_hu=1.0,
+        worst_weight=1.0, cvar_fraction=0.5)
+    assert torch.equal(legacy, half_cvar)
 
 
 def test_threshold_pixel_sampling_keeps_tensors_aligned():
@@ -264,9 +288,33 @@ def test_threshold_pixel_sampling_keeps_tensors_aligned():
     target = pred + 200.0
     p, z, y = sampled_threshold_pixels(
         pred, trunk, target, max_pixels=5, training=False)
-    assert p.numel() == 5
-    assert torch.equal(z - p, torch.full((5,), 100.0))
-    assert torch.equal(y - p, torch.full((5,), 200.0))
+    assert p.shape == (1, 5)
+    assert torch.equal(z - p, torch.full((1, 5), 100.0))
+    assert torch.equal(y - p, torch.full((1, 5), 200.0))
+
+
+def test_threshold_pixel_sampling_preserves_each_image():
+    pred = torch.stack([torch.arange(10.0), torch.arange(10.0) + 100.0])
+    trunk = pred + 1000.0
+    target = pred + 2000.0
+    p, z, y = sampled_threshold_pixels(
+        pred, trunk, target, max_pixels=8, training=False)
+    assert p.shape == (2, 4)
+    assert p[0].max() < p[1].min()
+    assert torch.equal(z - p, torch.full((2, 4), 1000.0))
+    assert torch.equal(y - p, torch.full((2, 4), 2000.0))
+
+
+def test_threshold_sampling_includes_target_density():
+    args = SimpleNamespace(
+        threshold_samples=6, threshold_min_hu=-1000.0,
+        threshold_max_hu=1500.0, threshold_density_fraction=0.5)
+    reference = standardize_hu(torch.tensor([[-100.0, 50.0, 300.0, 900.0]]))
+    got = sampled_thresholds(args, reference, training=False)
+    assert got.numel() == 6
+    assert got[0] == -1000.0
+    assert got[-1] == 1500.0
+    assert any(-100.0 < float(value) < 900.0 for value in got)
 
 
 def test_curve_regularization_detects_broad_correction():
@@ -303,7 +351,11 @@ if __name__ == "__main__":
     test_patient_event_aggregation_is_pixel_weighted()
     test_threshold_correction_is_converted_to_hu()
     test_threshold_no_harm_penalizes_only_regression()
+    test_threshold_no_harm_cannot_cancel_harm_between_images()
     test_threshold_sampling_is_deterministic_for_validation()
+    test_zero_cvar_fraction_preserves_legacy_maximum()
     test_threshold_pixel_sampling_keeps_tensors_aligned()
+    test_threshold_pixel_sampling_preserves_each_image()
+    test_threshold_sampling_includes_target_density()
     test_curve_regularization_detects_broad_correction()
     print("full-slice-context checks: OK")

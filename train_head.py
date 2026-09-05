@@ -207,8 +207,14 @@ def parse_args():
     p.add_argument("--threshold-temperature-hu", type=float, default=5.0,
                    help="Sigmoid temperature for differentiable crossings.")
     p.add_argument("--threshold-worst-weight", type=float, default=1.0,
-                   help="Weight of the worst sampled threshold in addition "
-                        "to the mean threshold regression.")
+                   help="Weight of worst-threshold CVaR in addition to mean "
+                        "per-image threshold regression.")
+    p.add_argument("--threshold-cvar-fraction", type=float, default=0.0,
+                   help="Fraction of worst thresholds used by CVaR; 0 keeps "
+                        "the legacy single-maximum reduction.")
+    p.add_argument("--threshold-density-fraction", type=float, default=0.0,
+                   help="Fraction of thresholds sampled from target HU density; "
+                        "the remainder cover the HU range uniformly.")
     p.add_argument("--curve-identity-lambda", type=float, default=0.0,
                    help="Penalize mean squared correction over an HU grid.")
     p.add_argument("--curve-slope-lambda", type=float, default=0.0,
@@ -265,30 +271,68 @@ def hucal_term(pred, target, hucal, reduction):
 
 def sampled_thresholds(args, reference: torch.Tensor,
                        training: bool) -> torch.Tensor:
-    """Random training thresholds and deterministic validation thresholds."""
-    if training:
-        thresholds = torch.rand(args.threshold_samples, device=reference.device,
-                                dtype=reference.dtype)
-        return args.threshold_min_hu + thresholds * (
+    """Combine HU-range coverage with thresholds from the observed HU density."""
+    if not training:
+        return torch.linspace(args.threshold_min_hu, args.threshold_max_hu,
+                              args.threshold_samples, device=reference.device,
+                              dtype=reference.dtype)
+    density_count = round(args.threshold_samples
+                          * args.threshold_density_fraction)
+    if 0.0 < args.threshold_density_fraction < 1.0:
+        density_count = min(density_count, args.threshold_samples - 2)
+    uniform_count = args.threshold_samples - density_count
+    if uniform_count == 0:
+        uniform = reference.new_empty(0)
+    else:
+        uniform = torch.rand(uniform_count, device=reference.device,
+                             dtype=reference.dtype)
+        uniform = args.threshold_min_hu + uniform * (
             args.threshold_max_hu - args.threshold_min_hu)
-    return torch.linspace(args.threshold_min_hu, args.threshold_max_hu,
-                          args.threshold_samples, device=reference.device,
-                          dtype=reference.dtype)
+
+    if density_count == 0:
+        return uniform
+    reference_hu = (reference.detach().reshape(-1) * BENCHMARK_PIXEL_STD
+                    + BENCHMARK_PIXEL_MEAN - cfg.HU_OFFSET)
+    reference_hu = reference_hu[
+        (reference_hu >= args.threshold_min_hu)
+        & (reference_hu <= args.threshold_max_hu)]
+    if reference_hu.numel() == 0:
+        density = torch.linspace(args.threshold_min_hu, args.threshold_max_hu,
+                                 density_count, device=reference.device,
+                                 dtype=reference.dtype)
+    else:
+        indices = torch.randint(reference_hu.numel(), (density_count,),
+                                device=reference.device)
+        density = reference_hu[indices]
+    return torch.cat([uniform, density]).sort().values
 
 
 def sampled_threshold_pixels(pred, trunk, target, max_pixels, training):
-    """Select matching pixels without materializing threshold-by-image tensors."""
-    pred = pred.reshape(-1)
-    trunk = trunk.reshape(-1)
-    target = target.reshape(-1)
-    if pred.numel() <= max_pixels:
+    """Select aligned pixels per image, preserving patient-level reductions."""
+    if pred.shape != trunk.shape or pred.shape != target.shape:
+        raise ValueError("pred, trunk and target must have identical shapes")
+    if pred.ndim == 1:
+        pred = pred.unsqueeze(0)
+        trunk = trunk.unsqueeze(0)
+        target = target.unsqueeze(0)
+    batch = pred.shape[0]
+    if max_pixels < batch:
+        raise ValueError("max_pixels must allow at least one pixel per image")
+    pred = pred.reshape(batch, -1)
+    trunk = trunk.reshape(batch, -1)
+    target = target.reshape(batch, -1)
+    per_image = max(1, max_pixels // batch)
+    if pred.shape[1] <= per_image:
         return pred, trunk, target
     if training:
-        indices = torch.randint(pred.numel(), (max_pixels,), device=pred.device)
+        indices = torch.randint(pred.shape[1], (batch, per_image),
+                                device=pred.device)
     else:
-        indices = torch.linspace(0, pred.numel() - 1, max_pixels,
-                                 device=pred.device).long()
-    return pred[indices], trunk[indices], target[indices]
+        one_image = torch.linspace(0, pred.shape[1] - 1, per_image,
+                                   device=pred.device).long()
+        indices = one_image.unsqueeze(0).expand(batch, -1)
+    return (pred.gather(1, indices), trunk.gather(1, indices),
+            target.gather(1, indices))
 
 
 def curve_regularization(head, reference: torch.Tensor, args, ctx=None):
@@ -329,14 +373,15 @@ def objective(z, corr, target, head, args, hucal, ctx=None, training=True):
             anchor = head.water_anchor_penalty()
         loss = loss + args.water_anchor_lambda * anchor
     if args.threshold_no_harm_lambda > 0.0:
-        thresholds = sampled_thresholds(args, pred, training)
         threshold_pred, threshold_trunk, threshold_target = \
             sampled_threshold_pixels(
                 pred, z, target, args.threshold_pixel_samples, training)
+        thresholds = sampled_thresholds(args, threshold_target, training)
         loss = loss + args.threshold_no_harm_lambda * threshold_no_harm_loss(
             threshold_pred, threshold_trunk, threshold_target, thresholds,
             temperature_hu=args.threshold_temperature_hu,
-            worst_weight=args.threshold_worst_weight)
+            worst_weight=args.threshold_worst_weight,
+            cvar_fraction=args.threshold_cvar_fraction)
     if args.curve_identity_lambda > 0.0 or args.curve_slope_lambda > 0.0:
         identity, slope = curve_regularization(head, pred, args, ctx=ctx)
         loss = (loss + args.curve_identity_lambda * identity
@@ -469,15 +514,17 @@ def _context_diagnostics(trunk, head, val_loader, device, args):
 def validation_objective(trunk, head, loader, device, args, hucal):
     trunk.eval()
     head.eval()
-    total = count = 0.0
+    total = 0.0
+    count = 0
     for batch in loader:
         x = batch["image"].to(device, non_blocking=True)
         y = batch["label"].to(device, non_blocking=True)
         z = trunk(x)
         corr, ctx = compute_correction(head, batch, z)
-        total += float(objective(z, corr, y, head, args, hucal, ctx=ctx,
-                                 training=False))
-        count += 1
+        batch_size = x.shape[0]
+        total += batch_size * float(objective(
+            z, corr, y, head, args, hucal, ctx=ctx, training=False))
+        count += batch_size
     return total / max(1, count)
 
 
@@ -522,6 +569,10 @@ def main():
             raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
     if args.threshold_temperature_hu <= 0.0:
         raise ValueError("--threshold-temperature-hu must be > 0")
+    if not (0.0 <= args.threshold_cvar_fraction <= 1.0):
+        raise ValueError("--threshold-cvar-fraction must be in [0, 1]")
+    if not (0.0 <= args.threshold_density_fraction <= 1.0):
+        raise ValueError("--threshold-density-fraction must be in [0, 1]")
 
     hucal_bin_weights = None
     if args.hucal_bin_weights is not None:
@@ -591,7 +642,8 @@ def main():
         loss_desc += (f" + {args.threshold_no_harm_lambda}*ThresholdNoHarm"
                       f"[{args.threshold_samples} in "
                       f"{args.threshold_min_hu:g}:{args.threshold_max_hu:g} HU, "
-                      f"worst={args.threshold_worst_weight:g}]")
+                      f"CVaR={args.threshold_cvar_fraction:g}, "
+                      f"density={args.threshold_density_fraction:g}]")
     if args.curve_identity_lambda > 0.0:
         loss_desc += f" + {args.curve_identity_lambda}*CurveIdentity"
     if args.curve_slope_lambda > 0.0:
@@ -732,6 +784,8 @@ def main():
             "threshold_pixel_samples": args.threshold_pixel_samples,
             "threshold_temperature_hu": args.threshold_temperature_hu,
             "threshold_worst_weight": args.threshold_worst_weight,
+            "threshold_cvar_fraction": args.threshold_cvar_fraction,
+            "threshold_density_fraction": args.threshold_density_fraction,
             "curve_identity_lambda": args.curve_identity_lambda,
             "curve_slope_lambda": args.curve_slope_lambda,
             "curve_grid_points": args.curve_grid_points,

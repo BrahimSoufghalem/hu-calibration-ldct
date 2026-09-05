@@ -113,15 +113,16 @@ HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \
     --data-dir dataset --split 100p --head-type context \
     --context-full-slice --output-root runs_armE_full_slice
 
-# Threshold-agnostic no-harm head (recommended isolated ablation):
+# Threshold-agnostic no-harm v2 exploratory follow-up:
 HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \
     --data-dir dataset --split 100p --head-type context \
-    --context-full-slice --output-root runs_armE_no_harm \
-    --threshold-no-harm-lambda 1.0 --threshold-samples 16 \
-    --threshold-pixel-samples 65536 \
+    --context-full-slice --output-root runs_armE_no_harm_v2 \
+    --threshold-no-harm-lambda 5.0 --threshold-samples 32 \
+    --threshold-pixel-samples 131072 \
     --threshold-min-hu -1000 --threshold-max-hu 1500 \
     --threshold-temperature-hu 5 --threshold-worst-weight 1 \
-    --curve-identity-lambda 0.05 --curve-slope-lambda 0.01
+    --threshold-cvar-fraction 0.2 --threshold-density-fraction 0.5 \
+    --curve-identity-lambda 0.005 --curve-slope-lambda 0.001
 
 # Tissue-resolved audit of the frozen trunk and selected head:
 HU_RANGE_PRESET=benchmark python hu_audit.py --test-dir test \
@@ -130,20 +131,22 @@ HU_RANGE_PRESET=benchmark python hu_audit.py --test-dir test \
 
 # Audit a dense set of held-out thresholds after training:
 HU_RANGE_PRESET=benchmark python hu_audit.py --test-dir test \
-    --runs-root runs --heads-root runs_armE_no_harm --archs redcnn \
-    --threshold-grid=-1000,1500,5 --output hu_audit_e_no_harm
+    --runs-root runs --heads-root runs_armE_no_harm_v2 --archs redcnn \
+    --threshold-grid=-1000,1500,5 --output hu_audit_e_no_harm_v2
 ```
 
-The no-harm configuration still trains only the post-hoc head; the selected
-trunk checkpoint remains frozen. Training samples thresholds uniformly across
-the configured HU range and penalizes only increases in differentiable
-threshold disagreement relative to that trunk. Validation uses a deterministic
-evenly spaced grid, and the objective also penalizes broad correction magnitude
-and correction slope. The weights above are starting values for a registered
-ablation, not validated final hyperparameters. Run it independently for RED-CNN
-and ResNet, then audit a denser threshold grid and the existing quality/bias
-endpoints before accepting the configuration. All new options default to zero,
-so historical commands retain their original objective.
+The no-harm v2 configuration still trains only the post-hoc head; the selected
+trunk checkpoint remains frozen. It rectifies regression separately for every
+image and threshold, so improvement in one patient cannot hide harm in another.
+Half the thresholds cover the HU range uniformly and half follow the observed
+target-HU density. CVaR emphasizes the worst 20% of thresholds per image without
+using one noisy maximum. Validation uses deterministic grid/quantile thresholds.
+The weaker curve penalties discourage broad corrections without suppressing the
+anatomy-sensitive Bone correction as strongly as the first no-harm run. These
+remain starting values for an isolated ablation, not validated hyperparameters.
+Run RED-CNN and ResNet independently, then audit the dense grid and all existing
+quality/bias endpoints before accepting the configuration. New options do not
+change historical commands unless the no-harm weight is enabled.
 
 `hu_audit.py` reports, per patient and per tissue bin (AirLung / FatLow /
 Soft / Dense / Bone, Gaussian soft membership):

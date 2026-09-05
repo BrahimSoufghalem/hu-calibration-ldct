@@ -33,6 +33,8 @@ Arm C -- L_HU-Cal
   skipped (their gradient would be noise).
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -72,36 +74,52 @@ def hu_mae_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 def threshold_no_harm_loss(pred: torch.Tensor, trunk: torch.Tensor,
                            target: torch.Tensor, thresholds_hu: torch.Tensor,
                            temperature_hu: float = 5.0,
-                           worst_weight: float = 1.0) -> torch.Tensor:
+                           worst_weight: float = 1.0,
+                           cvar_fraction: float = 0.0) -> torch.Tensor:
     """Penalize threshold disagreement regressions relative to the trunk.
 
     Thresholds can span the full HU range rather than encoding one clinical
     cutoff. A sigmoid makes each threshold comparison differentiable. The
-    mean term protects the complete sampled range while the maximum term
-    prevents one bad threshold from being hidden by that average.
+    Regressions are rectified per image and threshold before reduction, so one
+    patient cannot hide harm to another. The mean protects the sampled range;
+    CVaR over each image's worst thresholds prevents local harm from being
+    hidden without relying on one noisy maximum.
     """
     if temperature_hu <= 0.0:
         raise ValueError("temperature_hu must be > 0")
     if worst_weight < 0.0:
         raise ValueError("worst_weight must be >= 0")
+    if not (0.0 <= cvar_fraction <= 1.0):
+        raise ValueError("cvar_fraction must be in [0, 1]")
     thresholds = thresholds_hu.reshape(-1)
     if thresholds.numel() == 0:
         raise ValueError("thresholds_hu must not be empty")
 
-    pred_hu = to_hu(pred)
-    trunk_hu = to_hu(trunk.detach())
-    target_hu = to_hu(target.detach())
+    if pred.shape != trunk.shape or pred.shape != target.shape:
+        raise ValueError("pred, trunk and target must have identical shapes")
+    if pred.ndim == 1:
+        pred = pred.unsqueeze(0)
+        trunk = trunk.unsqueeze(0)
+        target = target.unsqueeze(0)
+    pred_hu = to_hu(pred).reshape(pred.shape[0], -1)
+    trunk_hu = to_hu(trunk.detach()).reshape(pred.shape[0], -1)
+    target_hu = to_hu(target.detach()).reshape(pred.shape[0], -1)
     regressions = []
     for threshold in thresholds:
         target_pos = (target_hu > threshold).to(dtype=pred_hu.dtype)
         pred_pos = torch.sigmoid((pred_hu - threshold) / temperature_hu)
         trunk_pos = torch.sigmoid((trunk_hu - threshold) / temperature_hu)
-        head_disagree = (pred_pos - target_pos).abs().mean()
-        trunk_disagree = (trunk_pos - target_pos).abs().mean()
+        head_disagree = (pred_pos - target_pos).abs().mean(dim=1)
+        trunk_disagree = (trunk_pos - target_pos).abs().mean(dim=1)
         regressions.append(F.relu(head_disagree - trunk_disagree))
 
-    regressions = torch.stack(regressions)
-    return regressions.mean() + worst_weight * regressions.max()
+    regressions = torch.stack(regressions, dim=1)
+    if cvar_fraction == 0.0:
+        cvar = regressions.max(dim=1).values.mean()
+    else:
+        tail_size = math.ceil(regressions.shape[1] * cvar_fraction)
+        cvar = regressions.topk(tail_size, dim=1).values.mean(dim=1).mean()
+    return regressions.mean() + worst_weight * cvar
 
 
 def soft_bin_weights(ref_hu: torch.Tensor):
