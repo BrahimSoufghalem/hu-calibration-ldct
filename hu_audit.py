@@ -58,7 +58,9 @@ import config as cfg
 from benchmark_data import (
     BENCHMARK_PIXEL_STD, denormalize_to_pixel, standardize_hu,
 )
-from calibration_head import ContextCalibrationHead, load_head
+from calibration_head import (
+    ContextCalibrationHead, SpatialGatedCalibrationHead, load_head,
+)
 from evaluate_image import (
     ARCH_MAP, _head_checkpoint_meta, get_test_set, load_checkpoint,
 )
@@ -103,6 +105,8 @@ def _head_context(head, x, z, body):
 
 def _apply_head(head, x, z, body):
     context = _head_context(head, x, z, body)
+    if isinstance(head, SpatialGatedCalibrationHead):
+        return z + head.correction(z, context=context, source=x), context
     if isinstance(head, ContextCalibrationHead):
         return z + head.correction(z, context=context), context
     return head(z), None
@@ -282,11 +286,14 @@ def _finalize_event_stats(total, total_pixels):
 def _correction_at_threshold_hu(head, context, threshold, device, dtype):
     z_threshold = standardize_hu(torch.tensor(
         threshold, device=device, dtype=dtype)).reshape(1, 1)
-    if isinstance(head, ContextCalibrationHead):
+    if isinstance(head, SpatialGatedCalibrationHead):
+        raise ValueError(
+            "spatial threshold correction requires a real image neighborhood")
+    elif isinstance(head, ContextCalibrationHead):
         corr_z = head.correction(z_threshold, context=context)
     else:
         corr_z = head.correction(z_threshold)
-    return float(corr_z.reshape(-1)[0] * BENCHMARK_PIXEL_STD)
+    return float(corr_z.detach().reshape(-1)[0] * BENCHMARK_PIXEL_STD)
 
 
 @torch.no_grad()
@@ -306,6 +313,7 @@ def audit_head_threshold_patient(pid, patient_dir, model, head, device,
                      "bands": {band: 0 for band in _DISTANCE_BANDS_HU}}
               for name in names}
     correction_130 = []
+    correction_130_support = []
     slice_rows = []
     total_pixels = 0
 
@@ -325,9 +333,21 @@ def audit_head_threshold_patient(pid, patient_dir, model, head, device,
         n_pixels = int(full_hu.numel())
         total_pixels += n_pixels
 
-        corr_hu = _correction_at_threshold_hu(
-            head, context, threshold, device, trunk_z.dtype)
+        if isinstance(head, SpatialGatedCalibrationHead):
+            correction_map = head_hu - trunk_hu
+            near_threshold = (trunk_hu - threshold).abs() <= 0.5
+            if near_threshold.any():
+                support = int(near_threshold.sum())
+                corr_hu = float(correction_map[near_threshold].mean())
+            else:
+                support = 0
+                corr_hu = float("nan")
+        else:
+            support = n_pixels
+            corr_hu = _correction_at_threshold_hu(
+                head, context, threshold, device, trunk_z.dtype)
         correction_130.append(corr_hu)
+        correction_130_support.append(support)
 
         slice_row = {
             "PatientID": pid,
@@ -337,6 +357,7 @@ def audit_head_threshold_patient(pid, patient_dir, model, head, device,
             "Threshold_HU": threshold,
             "NumPixels": n_pixels,
             "CorrectionAt130_HU": corr_hu,
+            "CorrectionSupportAt130_Count": support,
         }
         for name, mask in masks.items():
             stats = stats_by_name[name]
@@ -344,15 +365,25 @@ def audit_head_threshold_patient(pid, patient_dir, model, head, device,
             _accumulate_event_stats(totals[name], stats, mask, distance)
         slice_rows.append(slice_row)
 
+    support_total = sum(correction_130_support)
+    weighted_correction = (
+        sum(value * support for value, support in zip(
+            correction_130, correction_130_support) if support)
+        / support_total if support_total else float("nan"))
+    finite_corrections = [value for value, support in zip(
+        correction_130, correction_130_support) if support]
     patient_row = {
         "PatientID": pid,
         "BodyType": body,
         "NumSlices": len(low),
         "Threshold_HU": threshold,
         "NumPixels": total_pixels,
-        "MeanCorrectionAt130_HU": sum(correction_130) / len(correction_130),
-        "MinCorrectionAt130_HU": min(correction_130),
-        "MaxCorrectionAt130_HU": max(correction_130),
+        "CorrectionSupportAt130_Count": support_total,
+        "MeanCorrectionAt130_HU": weighted_correction,
+        "MinCorrectionAt130_HU": (min(finite_corrections)
+                                   if finite_corrections else float("nan")),
+        "MaxCorrectionAt130_HU": (max(finite_corrections)
+                                   if finite_corrections else float("nan")),
     }
     for name, values in totals.items():
         _prefixed_stats(

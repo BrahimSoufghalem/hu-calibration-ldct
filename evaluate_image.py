@@ -38,7 +38,9 @@ from benchmark_data import (
     BENCHMARK_PIXEL_MEAN, BENCHMARK_PIXEL_STD,
     denormalize_to_pixel, standardize_hu,
 )
-from calibration_head import ContextCalibrationHead, load_head
+from calibration_head import (
+    ContextCalibrationHead, SpatialGatedCalibrationHead, load_head,
+)
 from metrics import (
     compute_psnr_windowed, compute_ssim_windowed,
     compute_rmse_hu, compute_vif_hu,
@@ -135,6 +137,8 @@ def _apply_calibration_head(head, x: torch.Tensor, z: torch.Tensor,
         context = head.oracle_context_from_bodies(z, [body] * z.shape[0])
     else:
         context = head.inferred_context(z)
+    if isinstance(head, SpatialGatedCalibrationHead):
+        return z + head.correction(z, context=context, source=x)
     return z + head.correction(z, context=context)
 
 
@@ -325,7 +329,9 @@ def main():
                     print(f"  ERROR loading head {head_ckpt}: {e}")
                     continue
                 context_mode = (
-                    "full-slice" if getattr(head, "full_slice_context", False)
+                    "spatial-full-slice"
+                    if isinstance(head, SpatialGatedCalibrationHead)
+                    else "full-slice" if getattr(head, "full_slice_context", False)
                     else "oracle" if getattr(head, "oracle", False)
                     else "inferred" if isinstance(head, ContextCalibrationHead)
                     else "intensity"

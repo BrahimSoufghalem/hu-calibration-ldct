@@ -124,6 +124,16 @@ HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \
     --threshold-cvar-fraction 0.2 --threshold-density-fraction 0.5 \
     --curve-identity-lambda 0.005 --curve-slope-lambda 0.001
 
+# Spatial-gated context head (frozen trunk; recommended next experiment):
+HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \
+    --data-dir dataset --split 100p --head-type spatial \
+    --context-full-slice --output-root runs_spatial_gated \
+    --spatial-hidden 16 --gate-kernel 3 \
+    --gate-sparsity-lambda 0.01 --gate-tv-lambda 0.001 \
+    --center-lambda 0 \
+    --threshold-no-harm-lambda 0 \
+    --curve-identity-lambda 0 --curve-slope-lambda 0
+
 # Tissue-resolved audit of the frozen trunk and selected head:
 HU_RANGE_PRESET=benchmark python hu_audit.py --test-dir test \
     --runs-root runs --heads-root runs_armE_full_slice \
@@ -134,6 +144,20 @@ HU_RANGE_PRESET=benchmark python hu_audit.py --test-dir test \
     --runs-root runs --heads-root runs_armE_no_harm_v2 --archs redcnn \
     --threshold-grid=-1000,1500,5 --output hu_audit_e_no_harm_v2
 ```
+
+The spatial head keeps the frozen trunk and context-conditioned bounded HU
+curve, but selectively attenuates its proposal through a per-pixel gate. It
+does not reverse the proposal direction. The gate sees the
+aligned low-dose input, trunk output, local trunk mean, local contrast, and
+full-slice context. The complete correction is identity-initialized; applied-
+correction sparsity discourages broad changes without rewarding a closed gate
+when the proposal is already zero, and total variation discourages noisy masks.
+Unlike the 1D heads, a spatially varying gate cannot retain a global monotonicity
+certificate. The first experiment deliberately disables strict threshold
+no-harm and curve penalties: v2 showed those can select the identity solution,
+whereas this run isolates whether local evidence resolves the calibration/
+crossing conflict. Train RED-CNN and ResNet independently and accept neither
+without dense threshold audit plus full image-quality evaluation.
 
 The no-harm v2 configuration still trains only the post-hoc head; the selected
 trunk checkpoint remains frozen. It rectifies regression separately for every
@@ -179,7 +203,7 @@ The evaluator:
 - reports clinically windowed PSNR/SSIM, physical-HU RMSE, and VIF per patient;
 - computes full-slice context from the uncropped standardized low-dose input,
   matching training and `hu_audit.py`;
-- supports intensity, inferred-context, full-slice-context, and oracle heads;
+- supports intensity, inferred-context, full-slice-context, spatial, and oracle heads;
 - writes the frozen trunk as `Cycle 00` and the selected head separately;
 - reports deltas against both the raw LDCT input and the frozen trunk;
 - validates architecture, normalization constants, data split, and exact trunk

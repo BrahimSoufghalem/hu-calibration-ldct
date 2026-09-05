@@ -61,6 +61,7 @@ and must be retrained.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import config as cfg
 from benchmark_data import BENCHMARK_PIXEL_MEAN, BENCHMARK_PIXEL_STD
@@ -336,6 +337,77 @@ class ContextCalibrationHead(nn.Module):
         return hu, hu_out
 
 
+class SpatialGatedCalibrationHead(ContextCalibrationHead):
+    """Context curve applied selectively using local image evidence.
+
+    The context-conditioned 1D curve proposes a bounded HU correction. A small
+    CNN gates that proposal per pixel from the trunk output, aligned low-dose
+    input, local mean and local contrast. This preserves identity initialization
+    and the correction-magnitude bound, but intentionally does not claim the
+    global 1D monotonicity certificate because the gate is spatially varying.
+    """
+
+    def __init__(self, hidden: int = 32, delta_hu: float = 80.0,
+                 kappa: float = 0.9, full_slice_context: bool = False,
+                 spatial_hidden: int = 16, gate_kernel: int = 3):
+        super().__init__(hidden=hidden, delta_hu=delta_hu, kappa=kappa,
+                         oracle=False,
+                         full_slice_context=full_slice_context)
+        if spatial_hidden <= 0:
+            raise ValueError("spatial_hidden must be > 0")
+        if gate_kernel < 3 or gate_kernel % 2 == 0:
+            raise ValueError("gate_kernel must be odd and >= 3")
+        self.spatial_hidden = int(spatial_hidden)
+        self.gate_kernel = int(gate_kernel)
+        self.gate_conv1 = nn.Conv2d(4, self.spatial_hidden,
+                                    self.gate_kernel, padding=0)
+        self.gate_conv2 = nn.Conv2d(self.spatial_hidden, self.spatial_hidden,
+                                    self.gate_kernel, padding=0)
+        self.gate_context = nn.Linear(self.context_dim, self.spatial_hidden)
+        self.gate_out = nn.Conv2d(self.spatial_hidden, 1, 1)
+        nn.init.normal_(self.gate_out.weight, std=0.01)
+        nn.init.zeros_(self.gate_out.bias)
+
+    def config(self) -> dict:
+        return {"type": "spatial", "hidden": self.hidden,
+                "delta_hu": self.delta_hu, "kappa": self.kappa,
+                "full_slice_context": self.full_slice_context,
+                "spatial_hidden": self.spatial_hidden,
+                "gate_kernel": self.gate_kernel}
+
+    def gate(self, z: torch.Tensor, context: torch.Tensor | None = None,
+             source: torch.Tensor | None = None) -> torch.Tensor:
+        if z.ndim != 4 or z.shape[1] != 1:
+            raise ValueError("spatial head expects z with shape (B, 1, H, W)")
+        if context is None:
+            context = self.context(z)
+        if source is None:
+            source = z
+        if source.shape != z.shape:
+            raise ValueError("source and z must have identical shapes")
+        radius = self.gate_kernel // 2
+        padded = F.pad(z, (radius, radius, radius, radius), mode="replicate")
+        local_mean = F.avg_pool2d(padded, self.gate_kernel, stride=1)
+        local_contrast = (z - local_mean).abs()
+        features = torch.cat([z, source, local_mean, local_contrast], dim=1)
+        h = F.silu(self.gate_conv1(F.pad(
+            features, (radius, radius, radius, radius), mode="replicate")))
+        context_bias = self.gate_context(context).unsqueeze(-1).unsqueeze(-1)
+        h = F.silu(self.gate_conv2(F.pad(
+            h, (radius, radius, radius, radius), mode="replicate"))
+            + context_bias)
+        return torch.sigmoid(self.gate_out(h))
+
+    def correction(self, z: torch.Tensor,
+                   context: torch.Tensor | None = None,
+                   source: torch.Tensor | None = None) -> torch.Tensor:
+        proposal = super().correction(z, context=context)
+        return proposal * self.gate(z, context=context, source=source)
+
+    def forward(self, z: torch.Tensor,
+                source: torch.Tensor | None = None) -> torch.Tensor:
+        return z + self.correction(z, source=source)
+
 def save_head(head, path: str, extra: dict | None = None):
     payload = {"head_state_dict": head.state_dict(),
                "head_config": head.config()}
@@ -348,7 +420,14 @@ def load_head(path: str, device):
     payload = torch.load(path, map_location=device, weights_only=False)
     head_config = dict(payload["head_config"])
     head_type = head_config.pop("type", "intensity")
-    cls = ContextCalibrationHead if head_type == "context" else CalibrationHead
+    classes = {
+        "intensity": CalibrationHead,
+        "context": ContextCalibrationHead,
+        "spatial": SpatialGatedCalibrationHead,
+    }
+    if head_type not in classes:
+        raise RuntimeError(f"Unknown calibration head type: {head_type}")
+    cls = classes[head_type]
     head = cls(**head_config).to(device)
     state = payload["head_state_dict"]
     if head_config.get("oracle"):

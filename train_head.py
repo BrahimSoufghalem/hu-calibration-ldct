@@ -102,7 +102,8 @@ from benchmark_data import (
     BENCHMARK_PIXEL_MEAN, BENCHMARK_PIXEL_STD, prepare_benchmark_data,
 )
 from calibration_head import (
-    CalibrationHead, ContextCalibrationHead, save_head,
+    CalibrationHead, ContextCalibrationHead, SpatialGatedCalibrationHead,
+    save_head,
 )
 from evaluate_image import load_checkpoint
 from hu_losses import HUCalLoss, BIN_NAMES, threshold_no_harm_loss
@@ -124,6 +125,8 @@ class TrunkWithHead(torch.nn.Module):
     def forward(self, x):
         with torch.no_grad():
             z = self.trunk(x)
+        if isinstance(self.head, SpatialGatedCalibrationHead):
+            return self.head(z, source=x)
         return self.head(z)
 
 
@@ -131,10 +134,11 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Arms D/E: constrained calibration heads")
     p.add_argument("--arch", required=True, choices=list(ARCH_CHOICES))
-    p.add_argument("--head-type", choices=["intensity", "context"],
+    p.add_argument("--head-type", choices=["intensity", "context", "spatial"],
                    default="intensity",
                    help="'intensity' = arm D (1D curve); "
-                        "'context' = arm E (per-image conditioned curve).")
+                         "'context' = arm E (per-image conditioned curve); "
+                         "'spatial' = context curve with a local evidence gate.")
     p.add_argument("--context-oracle", action="store_true",
                    help="Diagnostic upper bound: append the ground-truth "
                         "body-type one-hot to inferred context. "
@@ -173,6 +177,10 @@ def parse_args():
                    help="Hard bound on the correction magnitude in HU.")
     p.add_argument("--kappa",    type=float, default=0.9,
                    help="Monotonicity margin: T' >= 1 - kappa > 0.")
+    p.add_argument("--spatial-hidden", type=int, default=16,
+                   help="Hidden channels in the spatial gate.")
+    p.add_argument("--gate-kernel", type=int, default=3,
+                   help="Odd local kernel size for the spatial gate.")
 
     # Objective
     p.add_argument("--mse-weight",   type=float, default=1.0)
@@ -220,6 +228,11 @@ def parse_args():
     p.add_argument("--curve-slope-lambda", type=float, default=0.0,
                    help="Penalize squared correction slope over an HU grid.")
     p.add_argument("--curve-grid-points", type=int, default=128)
+    p.add_argument("--gate-sparsity-lambda", type=float, default=0.01,
+                   help="Penalize mean absolute applied correction (normalized "
+                        "by its hard bound) for spatial heads.")
+    p.add_argument("--gate-tv-lambda", type=float, default=0.001,
+                   help="Penalize spatial total variation of the gate.")
 
     p.add_argument("--select-by", choices=list(_SELECT_CHOICES),
                    default="val_loss",
@@ -231,6 +244,12 @@ def parse_args():
 
 
 def build_head(args, device):
+    if args.head_type == "spatial":
+        return SpatialGatedCalibrationHead(
+            hidden=args.hidden, delta_hu=args.delta_hu, kappa=args.kappa,
+            full_slice_context=args.context_full_slice,
+            spatial_hidden=args.spatial_hidden,
+            gate_kernel=args.gate_kernel).to(device)
     if args.head_type == "context":
         return ContextCalibrationHead(
             hidden=args.hidden, delta_hu=args.delta_hu, kappa=args.kappa,
@@ -342,7 +361,9 @@ def curve_regularization(head, reference: torch.Tensor, args, ctx=None):
                         dtype=reference.dtype)
     z_grid = ((hu + cfg.HU_OFFSET - BENCHMARK_PIXEL_MEAN)
               / BENCHMARK_PIXEL_STD)
-    if isinstance(head, ContextCalibrationHead):
+    if isinstance(head, SpatialGatedCalibrationHead):
+        raise ValueError("curve regularization is not defined for spatial heads")
+    elif isinstance(head, ContextCalibrationHead):
         if ctx is None:
             raise ValueError("context is required for context-curve regularization")
         grid = z_grid.reshape(1, -1).expand(ctx.shape[0], -1)
@@ -357,7 +378,8 @@ def curve_regularization(head, reference: torch.Tensor, args, ctx=None):
     return identity, slope
 
 
-def objective(z, corr, target, head, args, hucal, ctx=None, training=True):
+def objective(z, corr, target, head, args, hucal, ctx=None, source=None,
+              training=True):
     pred = z + corr
     loss = args.mse_weight * F.mse_loss(pred, target)
     if args.hucal_weight > 0.0:
@@ -386,11 +408,22 @@ def objective(z, corr, target, head, args, hucal, ctx=None, training=True):
         identity, slope = curve_regularization(head, pred, args, ctx=ctx)
         loss = (loss + args.curve_identity_lambda * identity
                 + args.curve_slope_lambda * slope)
+    if isinstance(head, SpatialGatedCalibrationHead) and training:
+        gate = head.gate(z, context=ctx, source=source)
+        if args.gate_sparsity_lambda > 0.0:
+            loss = loss + args.gate_sparsity_lambda * (
+                corr.abs().mean() / head.s)
+        if args.gate_tv_lambda > 0.0:
+            tv = ((gate[..., 1:, :] - gate[..., :-1, :]).abs().mean()
+                  + (gate[..., :, 1:] - gate[..., :, :-1]).abs().mean())
+            loss = loss + args.gate_tv_lambda * tv
     return loss
 
 
-def compute_correction(head, batch, z):
+def compute_correction(head, batch, z, source=None):
     ctx = batch_context(head, batch, z)
+    if isinstance(head, SpatialGatedCalibrationHead):
+        return head.correction(z, context=ctx, source=source), ctx
     if isinstance(head, ContextCalibrationHead):
         return head.correction(z, context=ctx), ctx
     return head.correction(z), None
@@ -420,6 +453,7 @@ def _context_diagnostics(trunk, head, val_loader, device, args):
     is_ctx = isinstance(head, ContextCalibrationHead)
 
     per_body = {"Chest": [], "Abdomen": []}
+    gate_by_body = {"Chest": [], "Abdomen": []}
     ctx_rows = {"Chest": [], "Abdomen": []}
     for batch in val_loader:
         x = batch["image"].to(device, non_blocking=True)
@@ -428,11 +462,18 @@ def _context_diagnostics(trunk, head, val_loader, device, args):
         ctx = batch_context(head, batch, z) if is_ctx else None
         if is_ctx and ctx is None:
             ctx = head.context(z)
-        corr = head.correction(z, context=ctx) * BENCHMARK_PIXEL_STD
+        if isinstance(head, SpatialGatedCalibrationHead):
+            gate = head.gate(z, context=ctx, source=x)
+            corr = head.correction(z, context=ctx, source=x)
+        else:
+            corr = head.correction(z, context=ctx)
+        corr = corr * BENCHMARK_PIXEL_STD
         for i, b in enumerate(bodies):
             key = "Chest" if str(b).lower().startswith("c") else "Abdomen"
             if len(per_body[key]) < 200:
                 per_body[key].append(float(corr[i].mean()))
+                if isinstance(head, SpatialGatedCalibrationHead):
+                    gate_by_body[key].append(float(gate[i].mean()))
                 ctx_rows[key].append(ctx[i].detach().cpu())
         if min(len(per_body["Chest"]), len(per_body["Abdomen"])) >= 200:
             break
@@ -450,6 +491,9 @@ def _context_diagnostics(trunk, head, val_loader, device, args):
         sd = (sum((a - m) ** 2 for a in v) / max(1, len(v) - 1)) ** 0.5
         print(f"  {key:<8}: mean corr {m:+7.2f} HU | sd {sd:5.2f} | "
               f"min {min(v):+7.2f} | max {max(v):+7.2f}")
+        if gate_by_body[key]:
+            print(f"            mean gate "
+                  f"{sum(gate_by_body[key]) / len(gate_by_body[key]):.4f}")
     if per_body["Chest"] and per_body["Abdomen"]:
         mc = sum(per_body["Chest"]) / len(per_body["Chest"])
         ma = sum(per_body["Abdomen"]) / len(per_body["Abdomen"])
@@ -457,6 +501,11 @@ def _context_diagnostics(trunk, head, val_loader, device, args):
               f"{abs(mc - ma):.2f} HU")
 
     if not is_ctx:
+        return
+
+    if isinstance(head, SpatialGatedCalibrationHead):
+        print("\n  Spatial head: bin-center transfer curves are omitted because "
+              "the deployed correction depends on real local neighborhoods.")
         return
 
     # Per-anatomy transfer curves at a representative (median) context.
@@ -520,10 +569,11 @@ def validation_objective(trunk, head, loader, device, args, hucal):
         x = batch["image"].to(device, non_blocking=True)
         y = batch["label"].to(device, non_blocking=True)
         z = trunk(x)
-        corr, ctx = compute_correction(head, batch, z)
+        corr, ctx = compute_correction(head, batch, z, source=x)
         batch_size = x.shape[0]
         total += batch_size * float(objective(
-            z, corr, y, head, args, hucal, ctx=ctx, training=False))
+            z, corr, y, head, args, hucal, ctx=ctx, source=x,
+            training=False))
         count += batch_size
     return total / max(1, count)
 
@@ -535,8 +585,9 @@ def main():
     if args.context_oracle and args.context_full_slice:
         raise ValueError("--context-oracle and --context-full-slice are mutually exclusive")
     if args.context_full_slice:
-        if args.head_type != "context":
-            raise ValueError("--context-full-slice requires --head-type context")
+        if args.head_type not in ("context", "spatial"):
+            raise ValueError(
+                "--context-full-slice requires --head-type context or spatial")
         if args.joint:
             raise ValueError("--context-full-slice is post-hoc only")
         if args.select_by != "val_loss":
@@ -550,7 +601,18 @@ def main():
         if args.select_by != "val_loss":
             raise ValueError("--context-oracle requires --select-by "
                              "val_loss (metric validation cannot pass "
-                             "body-type labels through the model forward)")
+                              "body-type labels through the model forward)")
+    if args.head_type == "spatial":
+        if not args.context_full_slice:
+            raise ValueError("--head-type spatial requires --context-full-slice")
+        if args.joint:
+            raise ValueError("--head-type spatial is post-hoc only; do not use --joint")
+        if args.select_by != "val_loss":
+            raise ValueError("--head-type spatial requires --select-by val_loss")
+        if args.water_anchor_lambda > 0.0:
+            raise ValueError("--water-anchor-lambda is not defined for spatial heads")
+        if args.curve_identity_lambda > 0.0 or args.curve_slope_lambda > 0.0:
+            raise ValueError("curve regularization is not defined for spatial heads")
     if args.joint and args.max_iterations <= 5_000:
         print("  WARNING: --joint with a tiny budget "
               f"({args.max_iterations} iters). For reportable joint runs "
@@ -564,7 +626,8 @@ def main():
     if args.threshold_min_hu >= args.threshold_max_hu:
         raise ValueError("--threshold-min-hu must be less than --threshold-max-hu")
     for name in ("threshold_no_harm_lambda", "threshold_worst_weight",
-                 "curve_identity_lambda", "curve_slope_lambda"):
+                 "curve_identity_lambda", "curve_slope_lambda",
+                 "gate_sparsity_lambda", "gate_tv_lambda"):
         if getattr(args, name) < 0.0:
             raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
     if args.threshold_temperature_hu <= 0.0:
@@ -615,7 +678,9 @@ def main():
         bin_weights=hucal_bin_weights,
     )
 
-    if args.head_type == "context":
+    if args.head_type == "spatial":
+        arm = "Spatial-gated full-slice context head (frozen trunk)"
+    elif args.head_type == "context":
         if args.context_oracle:
             arm = "E-oracle (ground-truth context, frozen trunk)"
         elif args.context_full_slice:
@@ -634,8 +699,11 @@ def main():
                  f" + {args.hucal_slope_lambda}*|a-1|"
                  f" + {args.hucal_intercept_lambda}*|b|)"
                  f"[{args.hucal_reduction}]")
-    if args.head_type == "context" and args.center_lambda > 0.0:
+    if args.head_type in ("context", "spatial") and args.center_lambda > 0.0:
         loss_desc += f" + {args.center_lambda}*Center"
+    if args.head_type == "spatial":
+        loss_desc += (f" + {args.gate_sparsity_lambda}*GateSparsity"
+                      f" + {args.gate_tv_lambda}*GateTV")
     if args.water_anchor_lambda > 0.0:
         loss_desc += f" + {args.water_anchor_lambda}*WaterAnchor"
     if args.threshold_no_harm_lambda > 0.0:
@@ -659,8 +727,11 @@ def main():
           + (" [ORACLE]" if args.context_oracle else "")
           + (" [FULL-SLICE CONTEXT]" if args.context_full_slice else "")
           + f", hidden={args.hidden}, "
-          f"|corr|<={args.delta_hu} HU, T'>={1.0 - args.kappa:.2f} "
-          f"({n_params} params)")
+          f"|corr|<={args.delta_hu} HU, "
+          + ("spatial gate (no global monotonicity certificate) "
+             if args.head_type == "spatial"
+             else f"T'>={1.0 - args.kappa:.2f} ")
+          + f"({n_params} params)")
     print(f"  Objective      : {loss_desc}")
     print(f"  Budget         : {args.max_iterations} iterations")
     print(f"  Select best by : {args.select_by}")
@@ -687,6 +758,10 @@ def main():
 
     iteration = 0
     best_score = -float("inf")
+    identity_state = None
+    identity_score = None
+    identity_val_obj = None
+    best_iteration = None
     start = time.time()
     cycle = 0
 
@@ -699,6 +774,16 @@ def main():
             else validate(wrapped, val_loader, device)
         obj0 = validation_objective(trunk, head, val_loader, device,
                                     args, hucal)
+        identity_state = {
+            key: value.detach().cpu().clone()
+            for key, value in head.state_dict().items()
+        }
+        identity_score = -obj0 if args.select_by == "val_loss" else (
+            selection_score(val0, args.select_by) if val0 is not None
+            else None)
+        identity_val_obj = obj0
+        best_score = identity_score
+        best_iteration = 0
         if val0 is not None:
             print(
                 f"Cycle 00 | Iter 00000/{args.max_iterations} | "
@@ -734,8 +819,9 @@ def main():
             else:
                 with torch.no_grad():
                     z = trunk(x)
-            corr, ctx = compute_correction(head, batch, z)
-            loss = objective(z, corr, y, head, args, hucal, ctx=ctx)
+            corr, ctx = compute_correction(head, batch, z, source=x)
+            loss = objective(z, corr, y, head, args, hucal, ctx=ctx,
+                             source=x)
             loss.backward()
             optimizer.step()
             iteration += 1
@@ -767,6 +853,8 @@ def main():
             "head_hidden":     args.hidden,
             "delta_hu":        args.delta_hu,
             "kappa":           args.kappa,
+            "spatial_hidden":  args.spatial_hidden,
+            "gate_kernel":     args.gate_kernel,
             "head_lr":         args.head_lr,
             "trunk_lr":        args.lr if args.joint else None,
             "mse_weight":      args.mse_weight,
@@ -789,6 +877,8 @@ def main():
             "curve_identity_lambda": args.curve_identity_lambda,
             "curve_slope_lambda": args.curve_slope_lambda,
             "curve_grid_points": args.curve_grid_points,
+            "gate_sparsity_lambda": args.gate_sparsity_lambda,
+            "gate_tv_lambda": args.gate_tv_lambda,
             "budget_iterations": args.max_iterations,
             "select_by":       args.select_by,
             "normalization":   "benchmark_meanstd",
@@ -820,6 +910,7 @@ def main():
             torch.save(trunk_payload, os.path.join(out_dir, "last_model.pt"))
         if score > best_score:
             best_score = score
+            best_iteration = iteration
             save_head(head, os.path.join(out_dir, "best_head.pt"), extra)
             if args.joint:
                 torch.save(trunk_payload,
@@ -841,6 +932,24 @@ def main():
                 f"ValObj {val_obj:.6f} | val_loss {score:.6f} | "
                 f"{time.time() - t0:.1f}s"
             )
+
+    if best_iteration == 0:
+        current_state = {
+            key: value.detach().cpu().clone()
+            for key, value in head.state_dict().items()
+        }
+        head.load_state_dict(identity_state)
+        baseline_meta = meta.copy()
+        baseline_meta["selected_identity_baseline"] = True
+        save_head(head, os.path.join(out_dir, "best_head.pt"), {
+            "meta": baseline_meta,
+            "iteration": 0,
+            "score": identity_score,
+            "select_by": args.select_by,
+            "val_objective": identity_val_obj,
+            "val_detail": {},
+        })
+        head.load_state_dict(current_state)
 
     # ------------------------------------------------------------------
     # Final diagnostics

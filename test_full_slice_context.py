@@ -9,11 +9,14 @@ import torch
 from benchmark_data import (
     BENCHMARK_PIXEL_STD, FullSliceContextd, standardize_hu,
 )
-from calibration_head import ContextCalibrationHead
+from calibration_head import (
+    ContextCalibrationHead, SpatialGatedCalibrationHead, load_head, save_head,
+)
 from evaluate_image import (
     _apply_calibration_head, _head_checkpoint_meta, _patient_row,
 )
 from hu_audit import (
+    _apply_head,
     _accumulate_event_stats, _correction_at_threshold_hu,
     _finalize_event_stats, _mask_distance_stats, _paired_threshold_stats,
     _threshold_counts, _threshold_counts_grid, _threshold_metrics,
@@ -72,6 +75,86 @@ def test_evaluator_uses_low_dose_slice_for_full_context():
 
     assert torch.equal(got, expected)
     assert not torch.allclose(got, patch_context)
+
+
+def test_spatial_head_identity_init_and_bound():
+    head = SpatialGatedCalibrationHead(
+        full_slice_context=True, delta_hu=40.0)
+    z = torch.randn(2, 1, 16, 16)
+    source = torch.randn_like(z)
+    context = torch.randn(2, head.context_dim)
+    assert torch.equal(head.correction(z, context=context, source=source),
+                       torch.zeros_like(z))
+
+    torch.nn.init.constant_(head.fc3.bias, 20.0)
+    correction = head.correction(z, context=context, source=source)
+    assert correction.abs().max() * BENCHMARK_PIXEL_STD <= 40.0 + 1e-4
+
+
+def test_spatial_gate_uses_aligned_source_and_varies_by_pixel():
+    torch.manual_seed(4)
+    head = SpatialGatedCalibrationHead(full_slice_context=True)
+    torch.nn.init.normal_(head.gate_out.weight, std=0.2)
+    z = torch.zeros(1, 1, 12, 12)
+    source_a = torch.zeros_like(z)
+    source_b = source_a.clone()
+    source_b[..., 4:8, 4:8] = 3.0
+    context = torch.zeros(1, head.context_dim)
+    gate_a = head.gate(z, context=context, source=source_a)
+    gate_b = head.gate(z, context=context, source=source_b)
+    assert gate_b.std() > 0.0
+    assert not torch.allclose(gate_a, gate_b)
+
+
+def test_spatial_head_gradients_reach_curve_and_gate():
+    torch.manual_seed(5)
+    head = SpatialGatedCalibrationHead(full_slice_context=True)
+    z = torch.randn(2, 1, 8, 8)
+    source = torch.randn_like(z)
+    context = torch.randn(2, head.context_dim)
+    loss = head.correction(z, context=context, source=source).square().mean()
+    # Identity init makes the squared correction gradient zero; seed a proposal.
+    torch.nn.init.constant_(head.fc3.bias, 0.2)
+    loss = head.correction(z, context=context, source=source).square().mean()
+    loss.backward()
+    assert head.fc3.bias.grad.abs().sum() > 0.0
+    assert head.gate_out.weight.grad.abs().sum() > 0.0
+    assert head.gate_conv1.weight.grad.abs().sum() > 0.0
+    assert head.gate_conv2.weight.grad.abs().sum() > 0.0
+    assert head.gate_context.weight.grad.abs().sum() > 0.0
+
+
+def test_spatial_train_eval_audit_paths_match():
+    torch.manual_seed(7)
+    head = SpatialGatedCalibrationHead(full_slice_context=True)
+    torch.nn.init.constant_(head.fc3.bias, 0.2)
+    x = torch.randn(2, 1, 10, 10)
+    z = torch.randn_like(x)
+    context = head.inferred_context(x)
+    direct = z + head.correction(z, context=context, source=x)
+    evaluated = _apply_calibration_head(head, x, z, "Chest")
+    audited, audit_context = _apply_head(head, x, z, "Chest")
+    assert torch.equal(context, audit_context)
+    assert torch.equal(direct, evaluated)
+    assert torch.equal(direct, audited)
+
+
+def test_spatial_head_save_load_and_evaluator_round_trip():
+    torch.manual_seed(6)
+    head = SpatialGatedCalibrationHead(
+        full_slice_context=True, spatial_hidden=8, gate_kernel=5)
+    torch.nn.init.constant_(head.fc3.bias, 0.2)
+    torch.nn.init.normal_(head.gate_out.weight, std=0.1)
+    x = torch.randn(1, 1, 12, 12)
+    z = torch.randn_like(x)
+    expected = _apply_calibration_head(head, x, z, "Chest")
+    with TemporaryDirectory() as tmp:
+        path = Path(tmp) / "spatial.pt"
+        save_head(head, str(path))
+        loaded = load_head(str(path), torch.device("cpu"))
+    got = _apply_calibration_head(loaded, x, z, "Chest")
+    assert isinstance(loaded, SpatialGatedCalibrationHead)
+    assert torch.equal(got, expected)
 
 
 def test_evaluator_reports_deltas_against_cycle_zero():
@@ -341,6 +424,11 @@ if __name__ == "__main__":
     test_batch_context_uses_full_slice_statistics_not_patch()
     test_no_body_label_is_consumed_by_full_slice_context()
     test_evaluator_uses_low_dose_slice_for_full_context()
+    test_spatial_head_identity_init_and_bound()
+    test_spatial_gate_uses_aligned_source_and_varies_by_pixel()
+    test_spatial_head_gradients_reach_curve_and_gate()
+    test_spatial_train_eval_audit_paths_match()
+    test_spatial_head_save_load_and_evaluator_round_trip()
     test_evaluator_reports_deltas_against_cycle_zero()
     test_evaluator_rejects_mismatched_head_provenance()
     test_threshold_counts_report_error_direction()
