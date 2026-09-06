@@ -106,7 +106,10 @@ from calibration_head import (
     save_head,
 )
 from evaluate_image import load_checkpoint
-from hu_losses import HUCalLoss, BIN_NAMES, threshold_no_harm_loss
+from hu_losses import (
+    BIN_NAMES, HUCalLoss, SOFT_SIGMA_FRACTION, TISSUE_BINS,
+    threshold_no_harm_loss,
+)
 from models import ARCH_CHOICES, build_benchmark_model
 from train import apply_split, validate, selection_score
 from utils import setup_reproducibility, get_device, get_state_dict
@@ -222,7 +225,10 @@ def parse_args():
                         "the legacy single-maximum reduction.")
     p.add_argument("--threshold-density-fraction", type=float, default=0.0,
                    help="Fraction of thresholds sampled from target HU density; "
-                        "the remainder cover the HU range uniformly.")
+                         "the remainder cover the HU range uniformly.")
+    p.add_argument("--threshold-epsilon-pct", type=float, default=0.0,
+                   help="Allowed disagreement regression in percentage points "
+                        "before the threshold hinge activates.")
     p.add_argument("--curve-identity-lambda", type=float, default=0.0,
                    help="Penalize mean squared correction over an HU grid.")
     p.add_argument("--curve-slope-lambda", type=float, default=0.0,
@@ -233,6 +239,14 @@ def parse_args():
                         "by its hard bound) for spatial heads.")
     p.add_argument("--gate-tv-lambda", type=float, default=0.001,
                    help="Penalize spatial total variation of the gate.")
+    p.add_argument("--spatial-pareto-max-regression-pct", type=float,
+                   default=None,
+                   help="For spatial heads, select only checkpoints whose "
+                        "worst validation center-crop threshold regression is "
+                        "at most this many percentage points; rank feasible "
+                        "checkpoints by patient-balanced Chest Bone improvement.")
+    p.add_argument("--spatial-pareto-thresholds", type=int, default=251,
+                   help="Uniform validation thresholds used for Pareto selection.")
 
     p.add_argument("--select-by", choices=list(_SELECT_CHOICES),
                    default="val_loss",
@@ -403,7 +417,8 @@ def objective(z, corr, target, head, args, hucal, ctx=None, source=None,
             threshold_pred, threshold_trunk, threshold_target, thresholds,
             temperature_hu=args.threshold_temperature_hu,
             worst_weight=args.threshold_worst_weight,
-            cvar_fraction=args.threshold_cvar_fraction)
+            cvar_fraction=args.threshold_cvar_fraction,
+            epsilon_pct=args.threshold_epsilon_pct)
     if args.curve_identity_lambda > 0.0 or args.curve_slope_lambda > 0.0:
         identity, slope = curve_regularization(head, pred, args, ctx=ctx)
         loss = (loss + args.curve_identity_lambda * identity
@@ -578,6 +593,86 @@ def validation_objective(trunk, head, loader, device, args, hucal):
     return total / max(1, count)
 
 
+@torch.no_grad()
+def spatial_pareto_metrics(trunk, head, loader, device, args):
+    """Hard center-crop endpoints for constrained spatial-head selection."""
+    trunk.eval()
+    head.eval()
+    thresholds = torch.linspace(
+        args.threshold_min_hu, args.threshold_max_hu,
+        args.spatial_pareto_thresholds, device=device)
+    worst_regression_pct = 0.0
+    chest_patient = {}
+
+    for batch in loader:
+        x = batch["image"].to(device, non_blocking=True)
+        y = batch["label"].to(device, non_blocking=True)
+        z = trunk(x)
+        corr, _ = compute_correction(head, batch, z, source=x)
+        pred = z + corr
+        pred_hu = pred * BENCHMARK_PIXEL_STD + BENCHMARK_PIXEL_MEAN - cfg.HU_OFFSET
+        trunk_hu = z * BENCHMARK_PIXEL_STD + BENCHMARK_PIXEL_MEAN - cfg.HU_OFFSET
+        target_hu = y * BENCHMARK_PIXEL_STD + BENCHMARK_PIXEL_MEAN - cfg.HU_OFFSET
+
+        flat_target = target_hu.reshape(x.shape[0], -1)
+        flat_trunk = trunk_hu.reshape(x.shape[0], -1)
+        flat_pred = pred_hu.reshape(x.shape[0], -1)
+        for threshold_chunk in thresholds.split(8):
+            threshold_chunk = threshold_chunk.reshape(-1, 1, 1)
+            target_pos = flat_target.unsqueeze(0) > threshold_chunk
+            trunk_wrong = (flat_trunk.unsqueeze(0) > threshold_chunk) ^ target_pos
+            head_wrong = (flat_pred.unsqueeze(0) > threshold_chunk) ^ target_pos
+            regressions = (head_wrong.float().mean(dim=2)
+                           - trunk_wrong.float().mean(dim=2))
+            worst_regression_pct = max(
+                worst_regression_pct, 100.0 * float(regressions.max()))
+
+        for i, (body, patient) in enumerate(zip(
+                batch["body_type"], batch["patient"])):
+            if not str(body).lower().startswith("c"):
+                continue
+            # Bone soft-bin endpoint matches HUCalLoss's reference weighting.
+            center = 0.5 * (TISSUE_BINS[-1][1] + TISSUE_BINS[-1][2])
+            sigma = SOFT_SIGMA_FRACTION * (
+                TISSUE_BINS[-1][2] - TISSUE_BINS[-1][1])
+            weight = torch.exp(-0.5 * ((target_hu[i] - center) / sigma) ** 2)
+            values = chest_patient.setdefault(
+                str(patient), {"weight": 0.0, "trunk_error": 0.0,
+                               "head_error": 0.0})
+            values["weight"] += float(weight.sum())
+            values["trunk_error"] += float(
+                (weight * (trunk_hu[i] - target_hu[i])).sum())
+            values["head_error"] += float(
+                (weight * (pred_hu[i] - target_hu[i])).sum())
+
+    if not chest_patient or any(v["weight"] == 0.0
+                                for v in chest_patient.values()):
+        raise RuntimeError("Pareto validation found no Chest Bone support")
+    trunk_abs_bias = [abs(v["trunk_error"] / v["weight"])
+                      for v in chest_patient.values()]
+    head_abs_bias = [abs(v["head_error"] / v["weight"])
+                     for v in chest_patient.values()]
+    trunk_mean_abs_bias = sum(trunk_abs_bias) / len(trunk_abs_bias)
+    head_mean_abs_bias = sum(head_abs_bias) / len(head_abs_bias)
+    return {
+        "worst_center_crop_threshold_regression_pct": worst_regression_pct,
+        "chest_patient_mean_abs_bone_bias_trunk_hu": trunk_mean_abs_bias,
+        "chest_patient_mean_abs_bone_bias_head_hu": head_mean_abs_bias,
+        "chest_patient_mean_abs_bone_bias_improvement_hu":
+            trunk_mean_abs_bias - head_mean_abs_bias,
+        "num_chest_patients": len(chest_patient),
+    }
+
+
+def spatial_pareto_key(metrics, max_regression_pct):
+    """Lexicographic key: feasibility first, then patient-balanced Bone gain."""
+    regression = metrics["worst_center_crop_threshold_regression_pct"]
+    feasible = regression <= max_regression_pct
+    return (feasible,
+            metrics["chest_patient_mean_abs_bone_bias_improvement_hu"]
+            if feasible else -regression)
+
+
 def main():
     args = parse_args()
     if cfg.HU_RANGE_PRESET != "benchmark":
@@ -613,12 +708,20 @@ def main():
             raise ValueError("--water-anchor-lambda is not defined for spatial heads")
         if args.curve_identity_lambda > 0.0 or args.curve_slope_lambda > 0.0:
             raise ValueError("curve regularization is not defined for spatial heads")
+        if args.spatial_pareto_max_regression_pct is not None \
+                and args.spatial_pareto_max_regression_pct < 0.0:
+            raise ValueError("--spatial-pareto-max-regression-pct must be >= 0")
+    elif args.spatial_pareto_max_regression_pct is not None:
+        raise ValueError(
+            "--spatial-pareto-max-regression-pct requires --head-type spatial")
     if args.joint and args.max_iterations <= 5_000:
         print("  WARNING: --joint with a tiny budget "
               f"({args.max_iterations} iters). For reportable joint runs "
               "use the matched budget (30000).")
     if args.threshold_samples < 2:
         raise ValueError("--threshold-samples must be >= 2")
+    if args.spatial_pareto_thresholds < 2:
+        raise ValueError("--spatial-pareto-thresholds must be >= 2")
     if args.threshold_pixel_samples < 1:
         raise ValueError("--threshold-pixel-samples must be >= 1")
     if args.curve_grid_points < 2:
@@ -632,6 +735,8 @@ def main():
             raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
     if args.threshold_temperature_hu <= 0.0:
         raise ValueError("--threshold-temperature-hu must be > 0")
+    if args.threshold_epsilon_pct < 0.0:
+        raise ValueError("--threshold-epsilon-pct must be >= 0")
     if not (0.0 <= args.threshold_cvar_fraction <= 1.0):
         raise ValueError("--threshold-cvar-fraction must be in [0, 1]")
     if not (0.0 <= args.threshold_density_fraction <= 1.0):
@@ -711,7 +816,12 @@ def main():
                       f"[{args.threshold_samples} in "
                       f"{args.threshold_min_hu:g}:{args.threshold_max_hu:g} HU, "
                       f"CVaR={args.threshold_cvar_fraction:g}, "
-                      f"density={args.threshold_density_fraction:g}]")
+                      f"density={args.threshold_density_fraction:g}, "
+                      f"epsilon={args.threshold_epsilon_pct:g}pp]")
+    if args.spatial_pareto_max_regression_pct is not None:
+        loss_desc += (f" | ParetoSelect[worst <= "
+                      f"{args.spatial_pareto_max_regression_pct:g}pp, "
+                      f"{args.spatial_pareto_thresholds} thresholds]")
     if args.curve_identity_lambda > 0.0:
         loss_desc += f" + {args.curve_identity_lambda}*CurveIdentity"
     if args.curve_slope_lambda > 0.0:
@@ -758,9 +868,11 @@ def main():
 
     iteration = 0
     best_score = -float("inf")
+    best_selection_key = None
     identity_state = None
     identity_score = None
     identity_val_obj = None
+    identity_pareto = None
     best_iteration = None
     start = time.time()
     cycle = 0
@@ -782,6 +894,13 @@ def main():
             selection_score(val0, args.select_by) if val0 is not None
             else None)
         identity_val_obj = obj0
+        if args.head_type == "spatial" \
+                and args.spatial_pareto_max_regression_pct is not None:
+            identity_pareto = spatial_pareto_metrics(
+                trunk, head, val_loader, device, args)
+            best_selection_key = spatial_pareto_key(
+                identity_pareto, args.spatial_pareto_max_regression_pct)
+            identity_score = best_selection_key[1]
         best_score = identity_score
         best_iteration = 0
         if val0 is not None:
@@ -837,8 +956,18 @@ def main():
             else validate(wrapped, val_loader, device)
         val_obj = validation_objective(trunk, head, val_loader, device,
                                        args, hucal)
-        score = (-val_obj if args.select_by == "val_loss"
-                 else selection_score(val, args.select_by))
+        pareto = None
+        if args.head_type == "spatial" \
+                and args.spatial_pareto_max_regression_pct is not None:
+            pareto = spatial_pareto_metrics(
+                trunk, head, val_loader, device, args)
+            selection_key = spatial_pareto_key(
+                pareto, args.spatial_pareto_max_regression_pct)
+            score = selection_key[1]
+        else:
+            selection_key = None
+            score = (-val_obj if args.select_by == "val_loss"
+                     else selection_score(val, args.select_by))
 
         meta = {
             "architecture":    args.arch,
@@ -874,11 +1003,23 @@ def main():
             "threshold_worst_weight": args.threshold_worst_weight,
             "threshold_cvar_fraction": args.threshold_cvar_fraction,
             "threshold_density_fraction": args.threshold_density_fraction,
+            "threshold_epsilon_pct": args.threshold_epsilon_pct,
             "curve_identity_lambda": args.curve_identity_lambda,
             "curve_slope_lambda": args.curve_slope_lambda,
             "curve_grid_points": args.curve_grid_points,
             "gate_sparsity_lambda": args.gate_sparsity_lambda,
             "gate_tv_lambda": args.gate_tv_lambda,
+            "spatial_pareto_max_regression_pct":
+                args.spatial_pareto_max_regression_pct,
+            "spatial_pareto_thresholds": args.spatial_pareto_thresholds,
+            "spatial_pareto_threshold_grid_hu": (
+                torch.linspace(
+                    args.threshold_min_hu, args.threshold_max_hu,
+                    args.spatial_pareto_thresholds).tolist()
+                if args.spatial_pareto_max_regression_pct is not None else None),
+            "selection_method": ("spatial_pareto_center_crop"
+                                 if args.spatial_pareto_max_regression_pct
+                                 is not None else args.select_by),
             "budget_iterations": args.max_iterations,
             "select_by":       args.select_by,
             "normalization":   "benchmark_meanstd",
@@ -892,6 +1033,8 @@ def main():
         }
         extra = {"meta": meta, "iteration": iteration, "score": score,
                  "select_by": args.select_by, "val_objective": val_obj,
+                 "pareto_detail": pareto or {},
+                 "selection_key": selection_key,
                  "val_detail": ({k: v for k, v in val.items()}
                                 if val is not None else {})}
         save_head(head, os.path.join(out_dir, "last_head.pt"), extra)
@@ -908,8 +1051,12 @@ def main():
                 "val_detail": {k: v for k, v in val.items()},
             }
             torch.save(trunk_payload, os.path.join(out_dir, "last_model.pt"))
-        if score > best_score:
+        is_better = (selection_key > best_selection_key
+                     if selection_key is not None else score > best_score)
+        if is_better:
             best_score = score
+            if selection_key is not None:
+                best_selection_key = selection_key
             best_iteration = iteration
             save_head(head, os.path.join(out_dir, "best_head.pt"), extra)
             if args.joint:
@@ -926,10 +1073,16 @@ def main():
                 f"{time.time() - t0:.1f}s"
             )
         else:
+            pareto_desc = (f" | worstThr "
+                           f"{pareto['worst_center_crop_threshold_regression_pct']:.4f}pp"
+                           f" | BoneGain "
+                           f"{pareto['chest_patient_mean_abs_bone_bias_improvement_hu']:.2f}HU"
+                           if pareto is not None else "")
             print(
                 f"Cycle {cycle:02d} | Iter {iteration:05d}/"
                 f"{args.max_iterations} | Loss {train_loss:.6f} | "
-                f"ValObj {val_obj:.6f} | val_loss {score:.6f} | "
+                f"ValObj {val_obj:.6f} | score {score:.6f}"
+                f"{pareto_desc} | "
                 f"{time.time() - t0:.1f}s"
             )
 
@@ -947,6 +1100,8 @@ def main():
             "score": identity_score,
             "select_by": args.select_by,
             "val_objective": identity_val_obj,
+            "pareto_detail": identity_pareto or {},
+            "selection_key": best_selection_key,
             "val_detail": {},
         })
         head.load_state_dict(current_state)
@@ -972,8 +1127,11 @@ def main():
         _context_diagnostics(trunk, head, val_loader, device, args)
 
     total_t = time.strftime("%H:%M:%S", time.gmtime(time.time() - start))
+    effective_selector = ("spatial_pareto_center_crop"
+                          if args.spatial_pareto_max_regression_pct is not None
+                          else args.select_by)
     print(f"\nDone [{arm} / {args.arch.upper()}] in {total_t} | "
-          f"best {args.select_by}={best_score:.6f}")
+          f"best {effective_selector}={best_score:.6f}")
     print(f"Head checkpoint -> {os.path.join(out_dir, 'best_head.pt')}")
     if args.joint:
         print(f"Trunk checkpoint -> {os.path.join(out_dir, 'best_model.pt')}")

@@ -134,6 +134,21 @@ HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \
     --threshold-no-harm-lambda 0 \
     --curve-identity-lambda 0 --curve-slope-lambda 0
 
+# Spatial gate + epsilon crossing constraint + Pareto checkpoint selection:
+HU_RANGE_PRESET=benchmark python train_head.py --arch redcnn \
+    --data-dir dataset --split 100p --head-type spatial \
+    --context-full-slice --output-root runs_spatial_pareto \
+    --spatial-hidden 16 --gate-kernel 3 \
+    --gate-sparsity-lambda 0.01 --gate-tv-lambda 0.001 \
+    --center-lambda 0 \
+    --threshold-no-harm-lambda 1.0 --threshold-epsilon-pct 0.02 \
+    --threshold-samples 32 --threshold-pixel-samples 131072 \
+    --threshold-min-hu -950 --threshold-max-hu 1500 \
+    --threshold-temperature-hu 5 --threshold-worst-weight 1 \
+    --threshold-cvar-fraction 0.2 --threshold-density-fraction 0.5 \
+    --spatial-pareto-max-regression-pct 0.05 \
+    --spatial-pareto-thresholds 246
+
 # Tissue-resolved audit of the frozen trunk and selected head:
 HU_RANGE_PRESET=benchmark python hu_audit.py --test-dir test \
     --runs-root runs --heads-root runs_armE_full_slice \
@@ -159,12 +174,24 @@ whereas this run isolates whether local evidence resolves the calibration/
 crossing conflict. Train RED-CNN and ResNet independently and accept neither
 without dense threshold audit plus full image-quality evaluation.
 
+The Pareto follow-up keeps the same spatial architecture. Its differentiable
+threshold hinge permits up to 0.02 percentage points of *soft-surrogate*
+regression before it activates; this is not a hard-threshold guarantee.
+Checkpoint selection is separate: on deterministic 128x128 validation center
+crops and a fixed grid from -950 to 1500 HU in 10-HU steps, a checkpoint must
+keep the worst per-crop hard-threshold regression at or below 0.05 percentage
+points. Feasible checkpoints are ranked by the patient-balanced mean reduction
+in absolute Chest Bone bias; the iteration-0 identity remains the fallback.
+These margins are experimental tolerances, not clinical safety guarantees, and
+final acceptance still requires the 5-HU full-slice test audit and image-quality
+evaluation.
+
 The no-harm v2 configuration still trains only the post-hoc head; the selected
 trunk checkpoint remains frozen. It rectifies regression separately for every
 image and threshold, so improvement in one patient cannot hide harm in another.
 Half the thresholds cover the HU range uniformly and half follow the observed
 target-HU density. CVaR emphasizes the worst 20% of thresholds per image without
-using one noisy maximum. Validation uses deterministic grid/quantile thresholds.
+using one noisy maximum. Validation uses a deterministic uniform grid.
 The weaker curve penalties discourage broad corrections without suppressing the
 anatomy-sensitive Bone correction as strongly as the first no-harm run. These
 remain starting values for an isolated ablation, not validated hyperparameters.

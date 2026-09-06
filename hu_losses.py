@@ -75,7 +75,8 @@ def threshold_no_harm_loss(pred: torch.Tensor, trunk: torch.Tensor,
                            target: torch.Tensor, thresholds_hu: torch.Tensor,
                            temperature_hu: float = 5.0,
                            worst_weight: float = 1.0,
-                           cvar_fraction: float = 0.0) -> torch.Tensor:
+                           cvar_fraction: float = 0.0,
+                           epsilon_pct: float = 0.0) -> torch.Tensor:
     """Penalize threshold disagreement regressions relative to the trunk.
 
     Thresholds can span the full HU range rather than encoding one clinical
@@ -91,6 +92,8 @@ def threshold_no_harm_loss(pred: torch.Tensor, trunk: torch.Tensor,
         raise ValueError("worst_weight must be >= 0")
     if not (0.0 <= cvar_fraction <= 1.0):
         raise ValueError("cvar_fraction must be in [0, 1]")
+    if epsilon_pct < 0.0:
+        raise ValueError("epsilon_pct must be >= 0")
     thresholds = thresholds_hu.reshape(-1)
     if thresholds.numel() == 0:
         raise ValueError("thresholds_hu must not be empty")
@@ -111,7 +114,8 @@ def threshold_no_harm_loss(pred: torch.Tensor, trunk: torch.Tensor,
         trunk_pos = torch.sigmoid((trunk_hu - threshold) / temperature_hu)
         head_disagree = (pred_pos - target_pos).abs().mean(dim=1)
         trunk_disagree = (trunk_pos - target_pos).abs().mean(dim=1)
-        regressions.append(F.relu(head_disagree - trunk_disagree))
+        regressions.append(F.relu(
+            head_disagree - trunk_disagree - epsilon_pct / 100.0))
 
     regressions = torch.stack(regressions, dim=1)
     if cvar_fraction == 0.0:

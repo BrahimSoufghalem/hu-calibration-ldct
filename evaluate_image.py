@@ -121,7 +121,9 @@ def _head_checkpoint_meta(path: Path, arch: str, trunk_path: Path,
     return {
         "HeadSeed": meta.get("seed"),
         "HeadIteration": payload.get("iteration"),
-        "HeadSelectBy": payload.get("select_by", meta.get("select_by")),
+        "HeadSelectBy": meta.get(
+            "selection_method",
+            payload.get("select_by", meta.get("select_by"))),
     }
 
 

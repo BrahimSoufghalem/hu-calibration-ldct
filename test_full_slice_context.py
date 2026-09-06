@@ -25,7 +25,7 @@ from hu_audit import (
 from hu_losses import threshold_no_harm_loss
 from train_head import (
     batch_context, curve_regularization, sampled_threshold_pixels,
-    sampled_thresholds,
+    sampled_thresholds, spatial_pareto_key,
 )
 
 
@@ -332,6 +332,49 @@ def test_threshold_no_harm_penalizes_only_regression():
     assert crossing_loss > 0.0
 
 
+def test_threshold_epsilon_allows_only_the_configured_margin():
+    target = standardize_hu(torch.tensor([[10.0]]))
+    trunk = target.clone()
+    slightly_worse = standardize_hu(torch.tensor([[0.1]]))
+    thresholds = torch.tensor([0.0])
+    no_margin = threshold_no_harm_loss(
+        slightly_worse, trunk, target, thresholds,
+        temperature_hu=1.0, worst_weight=0.0, epsilon_pct=0.0)
+    with_margin = threshold_no_harm_loss(
+        slightly_worse, trunk, target, thresholds,
+        temperature_hu=1.0, worst_weight=0.0, epsilon_pct=50.0)
+    assert no_margin > 0.0
+    assert with_margin == 0.0
+
+
+def test_spatial_pareto_selection_enforces_feasibility_then_bone_gain():
+    identity = {
+        "worst_threshold_regression_pct": 0.0,
+        "chest_bone_abs_improvement_hu": 0.0,
+    }
+    feasible = {
+        "worst_threshold_regression_pct": 0.04,
+        "chest_bone_abs_improvement_hu": 20.0,
+    }
+    infeasible = {
+        "worst_threshold_regression_pct": 0.06,
+        "chest_bone_abs_improvement_hu": 50.0,
+    }
+    cap = 0.05
+    for values in (identity, feasible, infeasible):
+        values["worst_center_crop_threshold_regression_pct"] = values.pop(
+            "worst_threshold_regression_pct")
+        values["chest_patient_mean_abs_bone_bias_improvement_hu"] = values.pop(
+            "chest_bone_abs_improvement_hu")
+    assert spatial_pareto_key(feasible, cap) > spatial_pareto_key(identity, cap)
+    assert spatial_pareto_key(identity, cap) > spatial_pareto_key(infeasible, cap)
+    exact_cap = {
+        "worst_center_crop_threshold_regression_pct": cap,
+        "chest_patient_mean_abs_bone_bias_improvement_hu": 1.0,
+    }
+    assert spatial_pareto_key(exact_cap, cap)[0]
+
+
 def test_threshold_no_harm_cannot_cancel_harm_between_images():
     target = standardize_hu(torch.tensor([[-10.0], [10.0]]))
     trunk = standardize_hu(torch.tensor([[-10.0], [-10.0]]))
@@ -439,6 +482,8 @@ if __name__ == "__main__":
     test_patient_event_aggregation_is_pixel_weighted()
     test_threshold_correction_is_converted_to_hu()
     test_threshold_no_harm_penalizes_only_regression()
+    test_threshold_epsilon_allows_only_the_configured_margin()
+    test_spatial_pareto_selection_enforces_feasibility_then_bone_gain()
     test_threshold_no_harm_cannot_cancel_harm_between_images()
     test_threshold_sampling_is_deterministic_for_validation()
     test_zero_cvar_fraction_preserves_legacy_maximum()
