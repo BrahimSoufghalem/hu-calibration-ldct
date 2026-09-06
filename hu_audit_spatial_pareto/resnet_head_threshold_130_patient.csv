@@ -1,0 +1,11 @@
+PatientID,BodyType,NumSlices,Threshold_HU,NumPixels,CorrectionSupportAt130_Count,MeanCorrectionAt130_HU,MinCorrectionAt130_HU,MaxCorrectionAt130_HU,FlipUp_Count,FlipUp_pct,FlipUp_MeanDistance_HU,FlipUp_Within1HU_pct,FlipUp_Within2HU_pct,FlipUp_Within5HU_pct,FlipUp_Within10HU_pct,FlipUp_Within20HU_pct,FlipDown_Count,FlipDown_pct,FlipDown_MeanDistance_HU,FlipDown_Within1HU_pct,FlipDown_Within2HU_pct,FlipDown_Within5HU_pct,FlipDown_Within10HU_pct,FlipDown_Within20HU_pct,NewDisagree_Count,NewDisagree_pct,NewDisagree_MeanDistance_HU,NewDisagree_Within1HU_pct,NewDisagree_Within2HU_pct,NewDisagree_Within5HU_pct,NewDisagree_Within10HU_pct,NewDisagree_Within20HU_pct,ResolvedDisagree_Count,ResolvedDisagree_pct,ResolvedDisagree_MeanDistance_HU,ResolvedDisagree_Within1HU_pct,ResolvedDisagree_Within2HU_pct,ResolvedDisagree_Within5HU_pct,ResolvedDisagree_Within10HU_pct,ResolvedDisagree_Within20HU_pct
+C121,Chest,392,130.0,102760448,12858,0.0,0.0,0.0,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,
+C135,Chest,355,130.0,93061120,15107,0.0,0.0,0.0,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,
+C170,Chest,359,130.0,94109696,15574,0.0,0.0,0.0,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,
+C249,Chest,350,130.0,91750400,8633,0.0,0.0,0.0,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,
+C280,Chest,369,130.0,96731136,13359,0.0,0.0,0.0,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,
+L006,Abdomen,215,130.0,56360960,18446,0.0,0.0,0.0,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,
+L107,Abdomen,202,130.0,52953088,17789,0.0,0.0,0.0,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,
+L220,Abdomen,156,130.0,40894464,20120,0.0,0.0,0.0,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,
+L221,Abdomen,99,130.0,25952256,10389,0.0,0.0,0.0,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,
+L241,Abdomen,155,130.0,40632320,19251,0.0,0.0,0.0,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,,0,0.0,,,,,,
